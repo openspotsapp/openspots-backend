@@ -269,75 +269,83 @@ app.post(
         const reservationRef = db.collection("reservations").doc();
         let reservationEmailData = null;
 
-        await db.runTransaction(async (tx) => {
-          // 1️⃣ READS (MUST COME FIRST)
-          const spotSnap = await tx.get(spotRef);
-          if (!spotSnap.exists) {
-            throw new Error("Spot does not exist");
-          }
+        try {
+          await db.runTransaction(async (tx) => {
+            // 1️⃣ READS (MUST COME FIRST)
+            const spotSnap = await tx.get(spotRef);
+            if (!spotSnap.exists) {
+              throw new Error("Spot does not exist");
+            }
 
-          const spotData = spotSnap.data();
+            const spotData = spotSnap.data();
 
-          if (!spotData.is_available) {
-            throw new Error("Spot already reserved");
-          }
+            if (!spotData.is_available) {
+              throw new Error("Spot already reserved");
+            }
 
-          const eventRef = db.collection("events").doc(eventId);
-          const eventSnap = await tx.get(eventRef);
-          const eventData = eventSnap.exists ? eventSnap.data() : null;
+            const eventRef = db.collection("events").doc(eventId);
+            const eventSnap = await tx.get(eventRef);
+            const eventData = eventSnap.exists ? eventSnap.data() : null;
 
-          const venueRef = eventData?.venue_ref || null;
-          const eventDate = eventData?.event_date || null;
-          const venueSnap = venueRef ? await tx.get(venueRef) : null;
-          const venueName = venueSnap?.data()?.name || "Venue";
-          const eventName = eventData?.event_name || "Event";
-          const spotLabel = spotData.spot_id || "SPOT";
-          const reservationId = reservationRef.id;
-          const appUrl = process.env.BASE_URL || "https://openspots.app";
-          const checkinUrl = `${appUrl}/checkin.html?reservationId=${reservationId}`;
-          const qrCodeUrl = `https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=${encodeURIComponent(checkinUrl)}`;
-          const confirmationCode = reservationId.slice(-6).toUpperCase();
+            const venueRef = eventData?.venue_ref || null;
+            const eventDate = eventData?.event_date || null;
+            const venueSnap = venueRef ? await tx.get(venueRef) : null;
+            const venueName = venueSnap?.data()?.name || "Venue";
+            const eventName = eventData?.event_name || "Event";
+            const spotLabel = spotData.spot_id || "SPOT";
+            const reservationId = reservationRef.id;
+            const appUrl = process.env.BASE_URL || "https://openspots.app";
+            const checkinUrl = `${appUrl}/checkin.html?reservationId=${reservationId}`;
+            const qrCodeUrl = `https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=${encodeURIComponent(checkinUrl)}`;
+            const confirmationCode = reservationId.slice(-6).toUpperCase();
 
-          // Build reservation payload with display cache fields
-          const reservationData = {
-            user_id: db.collection("users").doc(userId),
-            venue_id: venueRef,
-            spot_ref: spotRef,
-            event_ref: eventRef,
+            // Build reservation payload with display cache fields
+            const reservationData = {
+              user_id: db.collection("users").doc(userId),
+              venue_id: venueRef,
+              spot_ref: spotRef,
+              event_ref: eventRef,
 
-            // DISPLAY CACHE (schema-aligned)
-            venue_name: venueName,
-            event_name: eventName,
-            start_time: eventDate,
-            spot_label: spotLabel,
+              // DISPLAY CACHE (schema-aligned)
+              venue_name: venueName,
+              event_name: eventName,
+              start_time: eventDate,
+              spot_label: spotLabel,
 
-            price_paid: session.amount_total / 100,
-            status: "confirmed",
-            created_at: admin.firestore.FieldValue.serverTimestamp(),
-          };
+              price_paid: session.amount_total / 100,
+              status: "confirmed",
+              created_at: admin.firestore.FieldValue.serverTimestamp(),
+            };
 
-          if (session.id) reservationData.stripe_session_id = session.id;
-          if (session.payment_intent) {
-            reservationData.payment_intent = session.payment_intent;
-          }
+            if (session.id) reservationData.stripe_session_id = session.id;
+            if (session.payment_intent) {
+              reservationData.payment_intent = session.payment_intent;
+            }
 
-          // 2️⃣ WRITES (ONLY AFTER ALL READS)
-          tx.update(spotRef, {
-            is_available: false,
-            reserved_by: db.collection("users").doc(userId),
-            last_updated: admin.firestore.FieldValue.serverTimestamp(),
+            // 2️⃣ WRITES (ONLY AFTER ALL READS)
+            tx.update(spotRef, {
+              is_available: false,
+              reserved_by: db.collection("users").doc(userId),
+              last_updated: admin.firestore.FieldValue.serverTimestamp(),
+            });
+
+            tx.set(reservationRef, reservationData);
+
+            reservationEmailData = {
+              venueName,
+              eventName,
+              spotLabel,
+              qrCodeUrl,
+              confirmationCode
+            };
           });
-
-          tx.set(reservationRef, reservationData);
-
-          reservationEmailData = {
-            venueName,
-            eventName,
-            spotLabel,
-            qrCodeUrl,
-            confirmationCode
-          };
-        });
+        } catch (err) {
+          if (err?.message === "Spot already reserved") {
+            console.log("Spot already reserved — ignoring duplicate webhook");
+            return res.status(200).send("Already processed");
+          }
+          throw err;
+        }
 
         console.log("✅ Reservation created & spot locked");
         if (reservationEmailData) {
