@@ -9,6 +9,7 @@ import { getSpotStatus } from "./backend/spotStatus.js";
 import { amqpEvents, liveSpotCache } from "./backend/amqpClient.js";
 import { sendEmail, buildWelcomeEmail, buildPaymentMethodAddedEmail, buildReservationConfirmationEmail, buildParkingStartedEmail, buildParkingReceiptEmail, buildParkingCancelledEmail } from "./backend/email.js";
 import Stripe from "stripe";
+import crypto from "crypto";
 
 const require = createRequire(import.meta.url);
 const admin = require("firebase-admin");
@@ -51,6 +52,68 @@ const resolveUserFirstName = (user) =>
   user?.displayName ||
   "";
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
+const logError = (message, error, context = {}) => {
+  console.error({
+    level: "error",
+    message,
+    context,
+    error: {
+      message: error?.message || "Unknown error",
+      type: error?.type || null,
+      code: error?.code || null,
+      stack: error?.stack || null,
+    },
+    timestamp: new Date().toISOString(),
+  });
+};
+const buildPaymentIntentIdempotencyKey = ({
+  uid,
+  amount,
+  currency = "usd",
+  spotId = "",
+  eventId = "",
+}) => {
+  const seed = [
+    uid || "",
+    spotId || "",
+    eventId || "",
+    String(amount ?? ""),
+    String(currency).toLowerCase(),
+  ].join("|");
+  return `pi_${crypto.createHash("sha256").update(seed).digest("hex").slice(0, 40)}`;
+};
+const getOrCreateStripeCustomerId = async ({ uid, email }) => {
+  const userRef = db.collection("users").doc(uid);
+  const userSnap = await userRef.get();
+  const userData = userSnap.exists ? userSnap.data() : null;
+  const existingCustomerId = userData?.stripeCustomerId || null;
+  const existingSnakeCaseCustomerId = userData?.stripe_customer_id || null;
+
+  if (existingCustomerId) return existingCustomerId;
+  if (existingSnakeCaseCustomerId) {
+    await userRef.set(
+      {
+        stripeCustomerId: existingSnakeCaseCustomerId,
+      },
+      { merge: true }
+    );
+    return existingSnakeCaseCustomerId;
+  }
+
+  const customer = await stripe.customers.create({
+    email,
+    metadata: { uid },
+  });
+
+  await userRef.set(
+    {
+      stripeCustomerId: customer.id,
+    },
+    { merge: true }
+  );
+
+  return customer.id;
+};
 const ACTIVE_SESSION_INTERVAL = 60 * 1000; // 1 min
 const PENDING_SESSION_INTERVAL = 1000; // 1 sec
 const CONFIRM_WINDOW_MS = 30_000;
@@ -151,6 +214,7 @@ app.post(
     const sig = req.headers["stripe-signature"];
 
     let event;
+    let stripeEventRef;
 
     try {
       event = stripe.webhooks.constructEvent(
@@ -159,230 +223,239 @@ app.post(
         process.env.STRIPE_WEBHOOK_SECRET
       );
     } catch (err) {
-      console.error("❌ Webhook signature verification failed.", err.message);
+      logError("Webhook signature verification failed", err);
       return res.status(400).send(`Webhook Error: ${err.message}`);
     }
 
-    // STEP 1 ONLY: Log the event type
+    stripeEventRef = db.collection("stripe_events").doc(event.id);
+    try {
+      await stripeEventRef.create({
+        event_id: event.id,
+        event_type: event.type,
+        received_at: admin.firestore.FieldValue.serverTimestamp(),
+        processed: false,
+      });
+    } catch (err) {
+      if (err?.code === 6 || err?.code === "already-exists") {
+        return res.status(200).json({ received: true, duplicate: true });
+      }
+      logError("Failed to persist stripe webhook event", err, { eventId: event.id, eventType: event.type });
+      return res.status(500).json({ error: "Failed to persist webhook event" });
+    }
+
     console.log("✅ Stripe Webhook Received:", event.type);
 
-    switch (event.type) {
-      case "checkout.session.completed": {
-        const session = event.data.object;
+    try {
+      switch (event.type) {
+        case "checkout.session.completed": {
+          const session = event.data.object;
 
-        if (session.mode === "setup") {
-          const customerId = session.customer;
-          const setupIntentId = session.setup_intent;
+          if (session.mode === "setup") {
+            const customerId = session.customer;
+            const setupIntentId = session.setup_intent;
+            const setupIntent = await stripe.setupIntents.retrieve(setupIntentId);
+            const paymentMethodId = setupIntent.payment_method;
+            const customer = await stripe.customers.retrieve(customerId);
+            let userId = customer.metadata.uid;
 
-          // Retrieve SetupIntent
-          const setupIntent = await stripe.setupIntents.retrieve(setupIntentId);
-
-          const paymentMethodId = setupIntent.payment_method;
-
-          // Get Firebase user via Stripe metadata (or fallback by stripeCustomerId)
-          const customer = await stripe.customers.retrieve(customerId);
-          let userId = customer.metadata.uid;
-
-          if (!userId) {
-            const byCamel = await db.collection("users")
-              .where("stripeCustomerId", "==", customerId)
-              .limit(1)
-              .get();
-            if (!byCamel.empty) {
-              userId = byCamel.docs[0].id;
+            if (!userId) {
+              const byCamel = await db.collection("users")
+                .where("stripeCustomerId", "==", customerId)
+                .limit(1)
+                .get();
+              if (!byCamel.empty) userId = byCamel.docs[0].id;
             }
-          }
 
-          if (!userId) {
-            const bySnake = await db.collection("users")
-              .where("stripe_customer_id", "==", customerId)
-              .limit(1)
-              .get();
-            if (!bySnake.empty) {
-              userId = bySnake.docs[0].id;
+            if (!userId) {
+              const bySnake = await db.collection("users")
+                .where("stripe_customer_id", "==", customerId)
+                .limit(1)
+                .get();
+              if (!bySnake.empty) userId = bySnake.docs[0].id;
             }
-          }
 
-          if (!userId || !paymentMethodId) {
-            console.error("Missing uid or payment method");
+            if (!userId || !paymentMethodId) {
+              logError("Missing uid or payment method from setup session", new Error("Incomplete setup session data"), {
+                eventId: event.id,
+                customerId,
+                paymentMethodId,
+              });
+              break;
+            }
+
+            const pm = await stripe.paymentMethods.retrieve(paymentMethodId);
+            const card = pm.card || {};
+
+            await db.collection("users").doc(userId).set({
+              stripe_customer_id: customerId,
+              stripe_default_payment_method: paymentMethodId,
+              hasPaymentMethod: true,
+              payment_brand: card.brand || null,
+              payment_last4: card.last4 || null,
+              payment_exp_month: card.exp_month || null,
+              payment_exp_year: card.exp_year || null,
+              payment_updated_at: admin.firestore.FieldValue.serverTimestamp()
+            }, { merge: true });
+
+            console.log("✅ Payment method saved for user:", userId);
+            try {
+              const userSnap = await db.collection("users").doc(userId).get();
+              const user = userSnap.exists ? userSnap.data() : {};
+              const toEmail = user?.email || customer?.email;
+
+              if (toEmail) {
+                const email = buildPaymentMethodAddedEmail({
+                  firstName: resolveUserFirstName(user),
+                  appUrl: process.env.BASE_URL || "https://openspots.app",
+                  supportEmail: "support@openspots.app",
+                  cardBrand: card.brand || null,
+                  last4: card.last4 || null,
+                  expMonth: card.exp_month || null,
+                  expYear: card.exp_year || null,
+                  socials: SOCIALS
+                });
+
+                await sendEmail({ to: toEmail, subject: email.subject, html: email.html, text: email.text });
+                console.log("✅ Payment method email sent:", toEmail);
+              } else {
+                console.log("⚠️ No email found for user; skipping payment method email");
+              }
+            } catch (e) {
+              logError("Payment method email failed", e, { eventId: event.id, userId });
+            }
             break;
           }
 
-          const pm = await stripe.paymentMethods.retrieve(paymentMethodId);
-          const card = pm.card || {};
+          const { userId, eventId, spotId } = session.metadata || {};
 
-          await db.collection("users").doc(userId).set({
-            stripe_customer_id: customerId,
-            stripe_default_payment_method: paymentMethodId,
-            hasPaymentMethod: true,
-            payment_brand: card.brand || null,
-            payment_last4: card.last4 || null,
-            payment_exp_month: card.exp_month || null,
-            payment_exp_year: card.exp_year || null,
-            payment_updated_at: admin.firestore.FieldValue.serverTimestamp()
-          }, { merge: true });
+          console.log("🧠 Phase 3: Finalizing reservation", { userId, eventId, spotId });
 
-          console.log("✅ Payment method saved for user:", userId);
-          // Send "payment method added" email
+          if (!userId || !eventId || !spotId) {
+            throw new Error(`Missing metadata in checkout session: ${JSON.stringify(session.metadata || {})}`);
+          }
+
+          const spotRef = db.collection("spots").doc(spotId);
+          const reservationRef = db.collection("reservations").doc();
+          let reservationEmailData = null;
+
           try {
-            const userSnap = await db.collection("users").doc(userId).get();
-            const user = userSnap.exists ? userSnap.data() : {};
-            const toEmail = user?.email || customer?.email; // fallback to Stripe customer email
+            await db.runTransaction(async (tx) => {
+              const spotSnap = await tx.get(spotRef);
+              if (!spotSnap.exists) throw new Error("Spot does not exist");
 
-            if (toEmail) {
-              const email = buildPaymentMethodAddedEmail({
-                firstName: resolveUserFirstName(user),
-                appUrl: process.env.BASE_URL || "https://openspots.app",
-                supportEmail: "support@openspots.app",
-                cardBrand: card.brand || null,
-                last4: card.last4 || null,
-                expMonth: card.exp_month || null,
-                expYear: card.exp_year || null,
-                socials: SOCIALS
+              const spotData = spotSnap.data();
+              if (!spotData.is_available) throw new Error("Spot already reserved");
+
+              const eventRef = db.collection("events").doc(eventId);
+              const eventSnap = await tx.get(eventRef);
+              const eventData = eventSnap.exists ? eventSnap.data() : null;
+
+              const venueRef = eventData?.venue_ref || null;
+              const eventDate = eventData?.event_date || null;
+              const venueSnap = venueRef ? await tx.get(venueRef) : null;
+              const venueName = venueSnap?.data()?.name || "Venue";
+              const eventName = eventData?.event_name || "Event";
+              const spotLabel = spotData.spot_id || "SPOT";
+              const reservationId = reservationRef.id;
+              const appUrl = process.env.BASE_URL || "https://openspots.app";
+              const checkinUrl = `${appUrl}/checkin.html?reservationId=${reservationId}`;
+              const qrCodeUrl = `https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=${encodeURIComponent(checkinUrl)}`;
+              const confirmationCode = reservationId.slice(-6).toUpperCase();
+
+              const reservationData = {
+                user_id: db.collection("users").doc(userId),
+                venue_id: venueRef,
+                spot_ref: spotRef,
+                event_ref: eventRef,
+                venue_name: venueName,
+                event_name: eventName,
+                start_time: eventDate,
+                spot_label: spotLabel,
+                price_paid: session.amount_total / 100,
+                status: "confirmed",
+                created_at: admin.firestore.FieldValue.serverTimestamp(),
+              };
+
+              if (session.id) reservationData.stripe_session_id = session.id;
+              if (session.payment_intent) reservationData.payment_intent = session.payment_intent;
+
+              tx.update(spotRef, {
+                is_available: false,
+                reserved_by: db.collection("users").doc(userId),
+                last_updated: admin.firestore.FieldValue.serverTimestamp(),
               });
+              tx.set(reservationRef, reservationData);
 
-              await sendEmail({ to: toEmail, subject: email.subject, html: email.html, text: email.text });
-              console.log("✅ Payment method email sent:", toEmail);
-            } else {
-              console.log("⚠️ No email found for user; skipping payment method email");
+              reservationEmailData = {
+                venueName,
+                eventName,
+                spotLabel,
+                qrCodeUrl,
+                confirmationCode
+              };
+            });
+          } catch (err) {
+            if (err?.message === "Spot already reserved") {
+              console.log("Spot already reserved — ignoring duplicate webhook");
+              break;
             }
-          } catch (e) {
-            console.error("Payment method email failed:", e);
+            throw err;
+          }
+
+          console.log("✅ Reservation created & spot locked");
+          if (reservationEmailData) {
+            try {
+              const userSnap = await db.collection("users").doc(userId).get();
+              const user = userSnap.exists ? userSnap.data() : {};
+              const toEmail =
+                user?.email ||
+                session.customer_details?.email ||
+                session.customer_email;
+
+              if (toEmail) {
+                const email = buildReservationConfirmationEmail({
+                  to: toEmail,
+                  firstName: resolveUserFirstName(user),
+                  venueName: reservationEmailData.venueName,
+                  eventName: reservationEmailData.eventName,
+                  spotLabel: reservationEmailData.spotLabel,
+                  qrCodeUrl: reservationEmailData.qrCodeUrl,
+                  confirmationCode: reservationEmailData.confirmationCode,
+                  appUrl: process.env.BASE_URL || "https://openspots.app",
+                  supportEmail: "support@openspots.app"
+                });
+
+                await sendEmail({ to: toEmail, subject: email.subject, html: email.html, text: email.text });
+                console.log("✅ Reservation confirmation email sent:", toEmail);
+              } else {
+                console.log("⚠️ No email found for user; skipping reservation confirmation email");
+              }
+            } catch (e) {
+              logError("Reservation confirmation email failed", e, { eventId: event.id, userId });
+            }
           }
           break;
         }
-
-        const { userId, eventId, spotId } = session.metadata;
-
-        console.log("🧠 Phase 3: Finalizing reservation", {
-          userId,
-          eventId,
-          spotId,
-        });
-
-        if (!userId || !eventId || !spotId) {
-          console.error("❌ Missing metadata in checkout session", session.metadata);
-          return;
-        }
-
-        const spotRef = db.collection("spots").doc(spotId);
-        const reservationRef = db.collection("reservations").doc();
-        let reservationEmailData = null;
-
-        try {
-          await db.runTransaction(async (tx) => {
-            // 1️⃣ READS (MUST COME FIRST)
-            const spotSnap = await tx.get(spotRef);
-            if (!spotSnap.exists) {
-              throw new Error("Spot does not exist");
-            }
-
-            const spotData = spotSnap.data();
-
-            if (!spotData.is_available) {
-              throw new Error("Spot already reserved");
-            }
-
-            const eventRef = db.collection("events").doc(eventId);
-            const eventSnap = await tx.get(eventRef);
-            const eventData = eventSnap.exists ? eventSnap.data() : null;
-
-            const venueRef = eventData?.venue_ref || null;
-            const eventDate = eventData?.event_date || null;
-            const venueSnap = venueRef ? await tx.get(venueRef) : null;
-            const venueName = venueSnap?.data()?.name || "Venue";
-            const eventName = eventData?.event_name || "Event";
-            const spotLabel = spotData.spot_id || "SPOT";
-            const reservationId = reservationRef.id;
-            const appUrl = process.env.BASE_URL || "https://openspots.app";
-            const checkinUrl = `${appUrl}/checkin.html?reservationId=${reservationId}`;
-            const qrCodeUrl = `https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=${encodeURIComponent(checkinUrl)}`;
-            const confirmationCode = reservationId.slice(-6).toUpperCase();
-
-            // Build reservation payload with display cache fields
-            const reservationData = {
-              user_id: db.collection("users").doc(userId),
-              venue_id: venueRef,
-              spot_ref: spotRef,
-              event_ref: eventRef,
-
-              // DISPLAY CACHE (schema-aligned)
-              venue_name: venueName,
-              event_name: eventName,
-              start_time: eventDate,
-              spot_label: spotLabel,
-
-              price_paid: session.amount_total / 100,
-              status: "confirmed",
-              created_at: admin.firestore.FieldValue.serverTimestamp(),
-            };
-
-            if (session.id) reservationData.stripe_session_id = session.id;
-            if (session.payment_intent) {
-              reservationData.payment_intent = session.payment_intent;
-            }
-
-            // 2️⃣ WRITES (ONLY AFTER ALL READS)
-            tx.update(spotRef, {
-              is_available: false,
-              reserved_by: db.collection("users").doc(userId),
-              last_updated: admin.firestore.FieldValue.serverTimestamp(),
-            });
-
-            tx.set(reservationRef, reservationData);
-
-            reservationEmailData = {
-              venueName,
-              eventName,
-              spotLabel,
-              qrCodeUrl,
-              confirmationCode
-            };
-          });
-        } catch (err) {
-          if (err?.message === "Spot already reserved") {
-            console.log("Spot already reserved — ignoring duplicate webhook");
-            return res.status(200).send("Already processed");
-          }
-          throw err;
-        }
-
-        console.log("✅ Reservation created & spot locked");
-        if (reservationEmailData) {
-          try {
-            const userSnap = await db.collection("users").doc(userId).get();
-            const user = userSnap.exists ? userSnap.data() : {};
-            const toEmail =
-              user?.email ||
-              session.customer_details?.email ||
-              session.customer_email;
-
-            if (toEmail) {
-              const email = buildReservationConfirmationEmail({
-                to: toEmail,
-                firstName: resolveUserFirstName(user),
-                venueName: reservationEmailData.venueName,
-                eventName: reservationEmailData.eventName,
-                spotLabel: reservationEmailData.spotLabel,
-                qrCodeUrl: reservationEmailData.qrCodeUrl,
-                confirmationCode: reservationEmailData.confirmationCode,
-                appUrl: process.env.BASE_URL || "https://openspots.app",
-                supportEmail: "support@openspots.app"
-              });
-
-              await sendEmail({ to: toEmail, subject: email.subject, html: email.html, text: email.text });
-              console.log("✅ Reservation confirmation email sent:", toEmail);
-            } else {
-              console.log("⚠️ No email found for user; skipping reservation confirmation email");
-            }
-          } catch (e) {
-            console.error("Reservation confirmation email failed:", e);
-          }
-        }
-        break;
+        default:
+          break;
       }
-      default:
-        break;
+
+      await stripeEventRef.set({
+        processed: true,
+        processed_at: admin.firestore.FieldValue.serverTimestamp(),
+      }, { merge: true });
+    } catch (err) {
+      logError("Stripe webhook processing failed", err, { eventId: event.id, eventType: event.type });
+      try {
+        await stripeEventRef.set({
+          processed: false,
+          failed_at: admin.firestore.FieldValue.serverTimestamp(),
+          error_message: err?.message || "Webhook processing failed",
+        }, { merge: true });
+      } catch (markErr) {
+        logError("Failed to persist stripe webhook failure status", markErr, { eventId: event.id });
+      }
+      return res.status(500).json({ error: "Webhook processing failed" });
     }
 
     res.json({ received: true });
@@ -443,7 +516,7 @@ app.get("/stripe/success", async (req, res) => {
 
     res.redirect(`${process.env.BASE_URL}/my-spots.html`);
   } catch (err) {
-    console.error("Stripe success error:", err);
+    logError("Stripe success handler failed", err, { route: "/stripe/success" });
     res.status(500).send("Stripe success failed");
   }
 });
@@ -799,8 +872,86 @@ app.post("/create-checkout-session", async (req, res) => {
 
         res.json({ sessionId: session.id });
     } catch (error) {
-        console.error("Stripe session error:", error);
+        logError("Stripe checkout session creation failed", error, { route: "/create-checkout-session" });
         res.status(500).json({ error: "Failed to create checkout session" });
+    }
+});
+
+const createPaymentIntent = async ({
+    uid,
+    email,
+    amount,
+    currency = "usd",
+    spotId,
+    eventId,
+    flow,
+    metadata = {},
+}) => {
+    const customerId = await getOrCreateStripeCustomerId({ uid, email });
+    const idempotencyKey = buildPaymentIntentIdempotencyKey({
+        uid,
+        amount,
+        currency,
+        spotId,
+        eventId,
+    });
+
+    const paymentIntent = await stripe.paymentIntents.create(
+        {
+            amount,
+            currency: String(currency).toLowerCase(),
+            customer: customerId,
+            automatic_payment_methods: { enabled: true },
+            metadata: {
+                uid,
+                spotId: spotId || "",
+                eventId: eventId || "",
+                flow: flow || "",
+                ...metadata,
+            },
+        },
+        { idempotencyKey }
+    );
+
+    return { paymentIntent, customerId };
+};
+
+app.post("/create-payment-intent", async (req, res) => {
+    try {
+        const {
+            uid,
+            email,
+            amount,
+            currency,
+            spotId,
+            eventId,
+            flow,
+            metadata,
+        } = req.body;
+
+        if (!uid || !email || !Number.isInteger(amount) || amount <= 0) {
+            return res.status(400).json({ error: "Missing or invalid uid/email/amount" });
+        }
+
+        const { paymentIntent, customerId } = await createPaymentIntent({
+            uid,
+            email,
+            amount,
+            currency,
+            spotId,
+            eventId,
+            flow,
+            metadata,
+        });
+
+        return res.json({
+            paymentIntentId: paymentIntent.id,
+            clientSecret: paymentIntent.client_secret,
+            customerId,
+        });
+    } catch (err) {
+        logError("Payment intent creation failed", err, { route: "/create-payment-intent" });
+        return res.status(500).json({ error: "Failed to create payment intent" });
     }
 });
 
@@ -814,25 +965,7 @@ app.post("/create-setup-session", async (req, res) => {
         }
 
         // 1. Create or retrieve Stripe customer
-        let customer;
-
-        // Optional: look up user in Firestore if you already store stripeCustomerId
-        const userSnap = await admin.firestore().collection("users").doc(uid).get();
-
-        if (userSnap.exists && userSnap.data().stripeCustomerId) {
-            customer = await stripe.customers.retrieve(
-                userSnap.data().stripeCustomerId
-            );
-        } else {
-            customer = await stripe.customers.create({
-                email,
-                metadata: { uid },
-            });
-
-            await admin.firestore().collection("users").doc(uid).update({
-                stripeCustomerId: customer.id,
-            });
-        }
+        const customerId = await getOrCreateStripeCustomerId({ uid, email });
 
         // 2. Create Stripe Checkout session in SETUP mode
         const successUrl = spot
@@ -848,7 +981,7 @@ app.post("/create-setup-session", async (req, res) => {
 
         const session = await stripe.checkout.sessions.create({
             mode: "setup",
-            customer: customer.id,
+            customer: customerId,
             payment_method_types: ["card"],
             success_url: successUrl,
             cancel_url: cancelUrl,
@@ -856,7 +989,7 @@ app.post("/create-setup-session", async (req, res) => {
 
         res.json({ sessionId: session.id });
     } catch (err) {
-        console.error("Setup session error:", err);
+        logError("Setup session creation failed", err, { route: "/create-setup-session" });
         res.status(500).json({ error: "Failed to create setup session" });
     }
 });
