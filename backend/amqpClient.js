@@ -3,6 +3,7 @@ dotenv.config();
 // backend/amqpClient.js
 import amqp from "amqplib";
 import EventEmitter from "events";
+import { sensorProcessor } from "../server/sensors/sensorProcessor.js";
 
 // ─────────────────────────────────────────────
 // ENV VARIABLES
@@ -123,6 +124,10 @@ function handleMessage(msg) {
       timestamp: ts,
       phenomenon: payload.phenomenon,
       raw: payload
+    });
+
+    sensorProcessor(payload).catch((err) => {
+      console.error("❌ [SENSOR] Processing error:", err.message);
     });
 
     console.log(

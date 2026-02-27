@@ -542,6 +542,38 @@ app.get("/api/debug/live-cache", (req, res) => {
     res.json(liveSpotCache);
 });
 
+app.post("/users/register-device", async (req, res) => {
+    try {
+        const { uid, token } = req.body || {};
+
+        if (!uid || !token) {
+            return res.status(400).json({ error: "Missing uid or token" });
+        }
+
+        const userRef = db.collection("users").doc(uid);
+        const userSnap = await userRef.get();
+
+        if (!userSnap.exists) {
+            return res.status(404).json({ error: "User not found" });
+        }
+
+        const userData = userSnap.data() || {};
+        const updatePayload = {
+            fcm_tokens: admin.firestore.FieldValue.arrayUnion(token),
+        };
+
+        if (userData.notifications_enabled === undefined) {
+            updatePayload.notifications_enabled = true;
+        }
+
+        await userRef.set(updatePayload, { merge: true });
+        return res.json({ success: true });
+    } catch (err) {
+        console.error("Failed to register device token:", err);
+        return res.status(500).json({ error: "Failed to register device" });
+    }
+});
+
 // ─────────────────────────────────────────────
 // REAL-TIME UPDATES → SSE STREAM
 // ─────────────────────────────────────────────
