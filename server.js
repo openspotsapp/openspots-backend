@@ -896,10 +896,8 @@ app.post("/create-checkout-session", async (req, res) => {
                 eventId: eventId,
                 flow: flow || "",
             },
-            success_url: `${process.env.BASE_URL}/stripe/success?session_id={CHECKOUT_SESSION_ID}${
-                flow ? `&flow=${encodeURIComponent(flow)}` : ""
-            }`,
-            cancel_url: `${process.env.BASE_URL}/checkout.html?cancelled=true`,
+            success_url: "openspots://stripe-success",
+            cancel_url: "openspots://stripe-cancel",
         });
 
         res.json({ sessionId: session.id });
@@ -990,7 +988,7 @@ app.post("/create-payment-intent", async (req, res) => {
 // Create Stripe Setup session
 app.post("/create-setup-session", async (req, res) => {
     try {
-        const { uid, email, spot, flow } = req.body;
+        const { uid, email } = req.body;
 
         if (!uid || !email) {
             return res.status(400).json({ error: "Missing uid or email" });
@@ -999,24 +997,12 @@ app.post("/create-setup-session", async (req, res) => {
         // 1. Create or retrieve Stripe customer
         const customerId = await getOrCreateStripeCustomerId({ uid, email });
 
-        // 2. Create Stripe Checkout session in SETUP mode
-        const successUrl = spot
-            ? `${process.env.BASE_URL}/payment-success.html?spot=${encodeURIComponent(spot)}${
-                flow ? `&flow=${encodeURIComponent(flow)}` : ""
-              }`
-            : `${process.env.BASE_URL}/payment-success.html${
-                flow ? `?flow=${encodeURIComponent(flow)}` : ""
-              }`;
-        const cancelUrl = spot
-            ? `${process.env.BASE_URL}/add-payment.html?spot=${encodeURIComponent(spot)}`
-            : `${process.env.BASE_URL}/add-payment.html`;
-
         const session = await stripe.checkout.sessions.create({
             mode: "setup",
             customer: customerId,
             payment_method_types: ["card"],
-            success_url: successUrl,
-            cancel_url: cancelUrl,
+            success_url: "openspots://stripe-setup-success",
+            cancel_url: "openspots://stripe-cancel",
         });
 
         res.json({ sessionId: session.id });
