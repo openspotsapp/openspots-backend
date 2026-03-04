@@ -82,6 +82,39 @@ const buildPaymentIntentIdempotencyKey = ({
   ].join("|");
   return `pi_${crypto.createHash("sha256").update(seed).digest("hex").slice(0, 40)}`;
 };
+const resolveIdentityFromRequest = async (req) => {
+  const body = req.body || {};
+  let uid = body.uid || body.userId || null;
+  let email = body.email || null;
+
+  if (uid && email) {
+    return { uid, email };
+  }
+
+  const authHeader = req.headers?.authorization || req.headers?.Authorization;
+  if (typeof authHeader === "string" && authHeader.startsWith("Bearer ")) {
+    const token = authHeader.slice("Bearer ".length).trim();
+    if (token) {
+      try {
+        const decodedToken = await admin.auth().verifyIdToken(token);
+        uid = uid || decodedToken?.uid || null;
+        email = email || decodedToken?.email || null;
+      } catch (err) {
+        logError("Failed to verify Firebase ID token", err, { route: req.path });
+      }
+    }
+  }
+
+  return { uid, email };
+};
+const resolveCheckoutSessionUrl = async (session) => {
+  if (session?.url) {
+    return session.url;
+  }
+
+  const retrievedSession = await stripe.checkout.sessions.retrieve(session.id);
+  return retrievedSession?.url || null;
+};
 const getOrCreateStripeCustomerId = async ({ uid, email }) => {
   const userRef = db.collection("users").doc(uid);
   const userSnap = await userRef.get();
@@ -868,7 +901,9 @@ app.post("/api/lock-metered-spot", async (req, res) => {
 // Create Stripe Checkout session
 app.post("/create-checkout-session", async (req, res) => {
     try {
-        const { eventId, spotId, price, userId, flow } = req.body;
+        const body = req.body || {};
+        const { eventId, spotId, price, userId, flow } = body;
+        const { uid, email } = await resolveIdentityFromRequest(req);
 
         if (!spotId || !price) {
             return res.status(400).json({ error: "Missing required data" });
@@ -891,16 +926,30 @@ app.post("/create-checkout-session", async (req, res) => {
                 },
             ],
             metadata: {
-                userId: userId,
-                spotId: spotId,
-                eventId: eventId,
+                userId: userId || uid || "",
+                spotId: spotId || "",
+                eventId: eventId || "",
                 flow: flow || "",
             },
             success_url: "openspots://stripe-success",
             cancel_url: "openspots://stripe-cancel",
         });
 
-        res.json({ sessionId: session.id });
+        const url = await resolveCheckoutSessionUrl(session);
+        console.log({
+            level: "info",
+            message: "Checkout session created",
+            context: {
+                route: "/create-checkout-session",
+                uid: uid || null,
+                email: email || null,
+                hasUrl: Boolean(url),
+                sessionId: session.id,
+            },
+            timestamp: new Date().toISOString(),
+        });
+
+        res.json({ url, sessionId: session.id });
     } catch (error) {
         logError("Stripe checkout session creation failed", error, { route: "/create-checkout-session" });
         res.status(500).json({ error: "Failed to create checkout session" });
@@ -988,7 +1037,10 @@ app.post("/create-payment-intent", async (req, res) => {
 // Create Stripe Setup session
 app.post("/create-setup-session", async (req, res) => {
     try {
-        const { uid, email } = req.body;
+        const body = req.body || {};
+        const identity = await resolveIdentityFromRequest({ ...req, body });
+        const uid = identity.uid;
+        const email = identity.email;
 
         if (!uid || !email) {
             return res.status(400).json({ error: "Missing uid or email" });
@@ -1005,7 +1057,21 @@ app.post("/create-setup-session", async (req, res) => {
             cancel_url: "openspots://stripe-cancel",
         });
 
-        res.json({ sessionId: session.id });
+        const url = await resolveCheckoutSessionUrl(session);
+        console.log({
+            level: "info",
+            message: "Setup session created",
+            context: {
+                route: "/create-setup-session",
+                uid: uid || null,
+                email: email || null,
+                hasUrl: Boolean(url),
+                sessionId: session.id,
+            },
+            timestamp: new Date().toISOString(),
+        });
+
+        res.json({ url, sessionId: session.id });
     } catch (err) {
         logError("Setup session creation failed", err, { route: "/create-setup-session" });
         res.status(500).json({ error: "Failed to create setup session" });
