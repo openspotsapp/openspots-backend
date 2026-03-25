@@ -729,12 +729,17 @@ app.post("/api/parking/confirm-session", async (req, res) => {
         const sessionSnap = await sessionRef.get();
 
         if (!sessionSnap.exists) {
-            return res.status(200).json({ success: true });
+            return res.status(404).json({ error: "Session not found" });
         }
 
         const data = sessionSnap.data();
-        if (data.status !== "PENDING") {
-            return res.status(200).json({ success: true });
+        const status = typeof data.status === "string" ? data.status.toUpperCase() : "";
+        if (status !== "PENDING") {
+            return res.status(409).json({
+                error: "Session is not pending",
+                sessionId,
+                status
+            });
         }
 
         let zoneData = {};
@@ -754,6 +759,8 @@ app.post("/api/parking/confirm-session", async (req, res) => {
 
         await sessionRef.update({
             status: "ACTIVE",
+            started_at: admin.firestore.FieldValue.serverTimestamp(),
+            arrival_time: admin.firestore.FieldValue.serverTimestamp(),
             activated_at: admin.firestore.FieldValue.serverTimestamp(),
             rate_per_minute: ratePerMinute,
             regulation_type: zoneData.regulation_type,
@@ -762,6 +769,8 @@ app.post("/api/parking/confirm-session", async (req, res) => {
             price_charged: 0,
             total_minutes: 0
         });
+
+        console.log("SESSION SET TO ACTIVE:", sessionId);
 
         if (data.zone_id) {
             const zoneRef =
@@ -797,7 +806,7 @@ app.post("/api/parking/confirm-session", async (req, res) => {
             console.error("Parking started email failed:", e);
         }
 
-        return res.json({ success: true });
+        return res.json({ success: true, sessionId });
     } catch (err) {
         console.error("Failed to confirm parking session:", err);
         return res.status(500).json({ error: "Failed to confirm session" });
