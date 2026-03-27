@@ -202,9 +202,7 @@ setInterval(async () => {
 
       const startedAt = data.pending_started_at.toDate();
       const elapsedMs = now.toMillis() - startedAt.getTime();
-      const CONFIRM_BUFFER_MS = 5000;
-
-      if (elapsedMs < CONFIRM_WINDOW_MS + CONFIRM_BUFFER_MS) continue;
+      if (elapsedMs < CONFIRM_WINDOW_MS) continue;
 
       if (!data.zone_id) continue;
 
