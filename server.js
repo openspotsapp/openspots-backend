@@ -283,6 +283,102 @@ app.post(
         case "checkout.session.completed": {
           const session = event.data.object;
 
+          // ==========================
+          // 🚗 PARKING FLOW (NEW)
+          // ==========================
+          if (session.metadata?.flow === "parking") {
+            try {
+              const parkingSessionId =
+                session.metadata.parkingSessionId ||
+                session.metadata.sessionId;
+
+              if (!parkingSessionId) {
+                console.warn("⚠️ No parkingSessionId in metadata");
+                break;
+              }
+
+              const sessionRef = db.collection("parking_sessions").doc(parkingSessionId);
+              const sessionSnap = await sessionRef.get();
+
+              if (!sessionSnap.exists) {
+                console.warn("⚠️ Parking session not found:", parkingSessionId);
+                break;
+              }
+
+              const sessionData = sessionSnap.data();
+
+              // 🛑 IDEMPOTENCY CHECK
+              if (sessionData.status === "COMPLETED") {
+                console.log("⚠️ Session already completed:", parkingSessionId);
+                break;
+              }
+
+              const now = admin.firestore.FieldValue.serverTimestamp();
+
+              const startTime =
+                sessionData.started_at?.toDate?.() ||
+                sessionData.arrival_time?.toDate?.() ||
+                new Date();
+
+              const endTime = new Date();
+
+              const totalMinutes = Math.max(
+                1,
+                Math.floor((endTime - startTime) / 60000)
+              );
+
+              const totalAmount =
+                session.amount_total
+                  ? session.amount_total / 100
+                  : sessionData.price_charged || 0;
+
+              // ✅ UPDATE SESSION
+              await sessionRef.update({
+                status: "COMPLETED",
+                ended_at: now,
+                total_minutes: totalMinutes,
+                total_amount: totalAmount,
+                stripe_session_id: session.id,
+              });
+
+              console.log("✅ Parking session completed:", parkingSessionId);
+
+              // 📧 SEND RECEIPT EMAIL
+              const userRef = sessionData.user_id;
+              const userSnap = userRef ? await userRef.get() : null;
+              const user = userSnap?.exists ? userSnap.data() : {};
+              const toEmail = user?.email;
+
+              if (toEmail) {
+                const email = buildParkingReceiptEmail({
+                  firstName: resolveUserFirstName(user),
+                  supportEmail: "support@openspots.app",
+                  appUrl: process.env.BASE_URL || "https://openspots.app",
+                  zoneNumber: sessionData.zone_number,
+                  startTime: startTime.toLocaleString(),
+                  endTime: endTime.toLocaleString(),
+                  totalMinutes,
+                  totalAmount,
+                  socials: SOCIALS
+                });
+
+                await sendEmail({
+                  to: toEmail,
+                  subject: email.subject,
+                  html: email.html,
+                  text: email.text,
+                });
+
+                console.log("📧 Parking receipt sent:", toEmail);
+              }
+
+            } catch (err) {
+              logError("Parking webhook failed", err, { eventId: event.id });
+            }
+
+            break; // 🚨 CRITICAL: prevents reservation logic from running
+          }
+
           if (session.mode === "setup") {
             const customerId = session.customer;
             const setupIntentId = session.setup_intent;
@@ -820,42 +916,7 @@ app.post("/end-metered-session", async (req, res) => {
         if (!session_id || !zone_id) {
             return res.status(400).json({ error: "Missing session_id or zone_id" });
         }
-
-        await db.collection("parking_sessions").doc(session_id).update({
-            status: "COMPLETED",
-            ended_at: admin.firestore.FieldValue.serverTimestamp()
-        });
-
-        // Send receipt email
-        try {
-            const sessionSnap = await db.collection("parking_sessions").doc(session_id).get();
-            const s = sessionSnap.exists ? sessionSnap.data() : null;
-
-            if (s?.user_id) {
-                const userSnap = await s.user_id.get();
-                const user = userSnap.exists ? userSnap.data() : {};
-                const toEmail = user?.email;
-
-                if (toEmail) {
-                    const email = buildParkingReceiptEmail({
-                        firstName: resolveUserFirstName(user),
-                        supportEmail: "support@openspots.app",
-                        appUrl: process.env.BASE_URL || "https://openspots.app",
-                        zoneNumber: s.zone_number,
-                        startTime: s.arrival_time?.toDate?.().toLocaleString?.() || "",
-                        endTime: new Date().toLocaleString(),
-                        totalMinutes: s.total_minutes,
-                        totalAmount: s.price_charged,
-                        socials: SOCIALS
-                    });
-
-                    await sendEmail({ to: toEmail, subject: email.subject, html: email.html, text: email.text });
-                    console.log("✅ Receipt email sent:", toEmail);
-                }
-            }
-        } catch (e) {
-            console.error("Receipt email failed:", e);
-        }
+        // NOTE: Session completion + receipt email now handled via Stripe webhook
 
         const zoneRef = db.doc(zone_id);
 
@@ -939,6 +1000,7 @@ app.post("/create-checkout-session", async (req, res) => {
                 spotId: spotId || "",
                 eventId: eventId || "",
                 flow: flow || "",
+                parkingSessionId: body.parkingSessionId || ""
             },
             success_url: "openspots://stripe-success",
             cancel_url: "openspots://stripe-cancel",
