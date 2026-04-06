@@ -1002,7 +1002,7 @@ app.post("/create-checkout-session", async (req, res) => {
                 flow: flow || "",
                 parkingSessionId: body.parkingSessionId || ""
             },
-            success_url: `openspots://stripe-success?flow=${flow}&session_id={CHECKOUT_SESSION_ID}`,
+            success_url: `openspots://stripe-success?flow=${flow}&parkingSessionId=${parkingSessionId}&session_id={CHECKOUT_SESSION_ID}`,
             cancel_url: "openspots://stripe-cancel",
         });
 
