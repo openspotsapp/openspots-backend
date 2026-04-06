@@ -972,11 +972,17 @@ app.post("/api/lock-metered-spot", async (req, res) => {
 app.post("/create-checkout-session", async (req, res) => {
     try {
         const body = req.body || {};
+        const psId = body.parkingSessionId || "";
         const { eventId, spotId, price, userId, flow } = body;
+        const safeFlow = flow || "parking";
         const { uid, email } = await resolveIdentityFromRequest(req);
 
         if (!spotId || !price) {
             return res.status(400).json({ error: "Missing required data" });
+        }
+
+        if (flow === "parking" && !body.parkingSessionId) {
+            return res.status(400).json({ error: "Missing parkingSessionId for parking flow" });
         }
 
         const session = await stripe.checkout.sessions.create({
@@ -987,7 +993,9 @@ app.post("/create-checkout-session", async (req, res) => {
                     price_data: {
                         currency: "usd",
                         product_data: {
-                            name: "OpenSpots Parking Reservation",
+                            name: flow === "parking"
+                                ? "OpenSpots Parking Session"
+                                : "OpenSpots Reservation",
                             description: `Spot ${spotId}`,
                         },
                         unit_amount: price * 100,
@@ -999,10 +1007,10 @@ app.post("/create-checkout-session", async (req, res) => {
                 userId: userId || uid || "",
                 spotId: spotId || "",
                 eventId: eventId || "",
-                flow: flow || "",
+                flow: safeFlow,
                 parkingSessionId: body.parkingSessionId || ""
             },
-            success_url: `openspots://stripe-success?flow=${flow}&parkingSessionId=${parkingSessionId}&session_id={CHECKOUT_SESSION_ID}`,
+            success_url: `openspots://stripe-success?flow=${safeFlow}&parkingSessionId=${psId}&session_id={CHECKOUT_SESSION_ID}`,
             cancel_url: "openspots://stripe-cancel",
         });
 
