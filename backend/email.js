@@ -436,7 +436,7 @@ export function buildParkingStartedEmail({
         </table>
 
         <p style="margin:0 0 18px;">
-          You can end your session anytime from <strong>My Spots</strong>.
+          Your session will end automatically when you leave the parking spot.
         </p>
 
         <p style="margin:0 0 18px;">
