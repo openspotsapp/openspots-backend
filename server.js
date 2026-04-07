@@ -836,7 +836,18 @@ app.post("/api/parking/confirm-session", async (req, res) => {
         });
 
         const sessionRef = db.collection("parking_sessions").doc(sessionId);
-        const sessionSnap = await sessionRef.get();
+
+        console.log("🔎 Confirm attempt for session:", sessionId);
+
+        let sessionSnap;
+        for (let i = 0; i < 3; i++) {
+            sessionSnap = await sessionRef.get();
+
+            if (sessionSnap.exists) break;
+
+            console.warn(`⏳ Session not found, retrying... attempt ${i + 1}`);
+            await new Promise((r) => setTimeout(r, 300));
+        }
 
         console.log("🔍 CONFIRM LOOKUP RESULT", {
             exists: sessionSnap.exists,
@@ -844,6 +855,7 @@ app.post("/api/parking/confirm-session", async (req, res) => {
         });
 
         if (!sessionSnap.exists) {
+            console.error("❌ Session not found after retries:", sessionId);
             return res.status(404).json({ error: "Session not found" });
         }
 
@@ -885,7 +897,7 @@ app.post("/api/parking/confirm-session", async (req, res) => {
             total_minutes: 0
         });
 
-        console.log("SESSION SET TO ACTIVE:", sessionId);
+        console.log("✅ Session confirmed:", sessionId);
 
         if (data.zone_id) {
             const zoneRef =
