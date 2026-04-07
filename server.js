@@ -871,10 +871,12 @@ app.post("/api/parking/confirm-session", async (req, res) => {
 
         const data = sessionSnap.data();
         const status = typeof data.status === "string" ? data.status.toUpperCase() : "";
-        if (status !== "PENDING") {
+        console.log("🔁 Confirming session with status:", status);
+        const isRecoverable = status === "PENDING" || status === "EXPIRED";
+
+        if (!isRecoverable) {
             return res.status(409).json({
-                error: "Session is not pending",
-                sessionId,
+                error: "Session is not recoverable",
                 status
             });
         }
