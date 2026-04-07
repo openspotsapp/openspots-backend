@@ -202,7 +202,11 @@ setInterval(async () => {
 
       const startedAt = data.pending_started_at.toDate();
       const elapsedMs = now.toMillis() - startedAt.getTime();
-      if (elapsedMs < CONFIRM_WINDOW_MS) continue;
+      // Protection window to allow confirm to complete
+      if (elapsedMs < CONFIRM_WINDOW_MS + 2000) {
+        console.log("⏳ Skipping pending session during protection window:", docSnap.id);
+        continue;
+      }
 
       if (!data.zone_id) continue;
 
@@ -221,7 +225,8 @@ setInterval(async () => {
           status: "ACTIVE",
           activated_at: admin.firestore.FieldValue.serverTimestamp()
         });
-      } else if (elapsedMs > CONFIRM_WINDOW_MS + 2000) {
+      } else {
+        console.warn("🗑 Deleting expired pending session:", docSnap.id);
         await docSnap.ref.delete();
       }
     }
