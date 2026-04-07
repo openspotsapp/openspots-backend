@@ -770,6 +770,14 @@ app.post("/api/parking/create-pending", async (req, res) => {
             user_id: db.collection("users").doc(user_id)
         });
 
+        console.log("🟢 CREATE PENDING", {
+            sessionId: sessionRef.id,
+            zone_number,
+            user_id,
+            project: process.env.FIREBASE_PROJECT_ID,
+            instance: process.env.RENDER_INSTANCE_ID || "local"
+        });
+
         return res.json({ sessionId: sessionRef.id });
     } catch (err) {
         console.error("Failed to create pending session:", err);
@@ -821,8 +829,19 @@ app.post("/api/parking/confirm-session", async (req, res) => {
             return res.status(400).json({ error: "Missing sessionId" });
         }
 
+        console.log("🟡 CONFIRM SESSION REQUEST", {
+            sessionId,
+            project: process.env.FIREBASE_PROJECT_ID,
+            instance: process.env.RENDER_INSTANCE_ID || "local"
+        });
+
         const sessionRef = db.collection("parking_sessions").doc(sessionId);
         const sessionSnap = await sessionRef.get();
+
+        console.log("🔍 CONFIRM LOOKUP RESULT", {
+            exists: sessionSnap.exists,
+            sessionId
+        });
 
         if (!sessionSnap.exists) {
             return res.status(404).json({ error: "Session not found" });
