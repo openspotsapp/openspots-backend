@@ -226,8 +226,13 @@ setInterval(async () => {
           activated_at: admin.firestore.FieldValue.serverTimestamp()
         });
       } else {
-        console.warn("🗑 Deleting expired pending session:", docSnap.id);
-        await docSnap.ref.delete();
+        // Do not hard-delete pending sessions here. Deletions cause confirm-session 404 races.
+        // Keep the document and mark it as expired so clients/backend can still reason about it.
+        await docSnap.ref.update({
+          status: "EXPIRED",
+          expired_at: admin.firestore.FieldValue.serverTimestamp()
+        });
+        console.warn("⌛ Marked pending session as EXPIRED:", docSnap.id);
       }
     }
   } catch (err) {
@@ -968,7 +973,10 @@ app.post("/end-metered-session", async (req, res) => {
             .get();
 
         for (const pendingDoc of pendingSnap.docs) {
-            await pendingDoc.ref.delete();
+            await pendingDoc.ref.update({
+                status: "EXPIRED",
+                expired_at: admin.firestore.FieldValue.serverTimestamp(),
+            });
         }
 
         return res.json({ success: true });
