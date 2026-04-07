@@ -221,7 +221,7 @@ setInterval(async () => {
           status: "ACTIVE",
           activated_at: admin.firestore.FieldValue.serverTimestamp()
         });
-      } else {
+      } else if (elapsedMs > CONFIRM_WINDOW_MS + 2000) {
         await docSnap.ref.delete();
       }
     }
