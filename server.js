@@ -865,11 +865,37 @@ app.post("/api/parking/confirm-session", async (req, res) => {
         });
 
         if (!sessionSnap.exists) {
-            console.error("❌ Session not found after retries:", sessionId);
-            return res.status(404).json({ error: "Session not found" });
+            console.warn("⚠️ Session not found by ID, attempting fallback lookup");
+
+            const { user_id, zone_number } = req.body;
+
+            if (!user_id || !zone_number) {
+                return res.status(404).json({ error: "Session not found and no fallback data" });
+            }
+
+            const fallbackQuery = await db
+                .collection("parking_sessions")
+                .where("user_id", "==", db.collection("users").doc(user_id))
+                .where("zone_number", "==", zone_number)
+                .where("status", "in", ["PENDING", "EXPIRED"])
+                .orderBy("created_at", "desc")
+                .limit(1)
+                .get();
+
+            if (fallbackQuery.empty) {
+                console.error("❌ Fallback also failed");
+                return res.status(404).json({ error: "Session not found" });
+            }
+
+            const fallbackDoc = fallbackQuery.docs[0];
+            sessionSnap = fallbackDoc;
+
+            console.log("♻️ Fallback session recovered:", fallbackDoc.id);
         }
 
         const data = sessionSnap.data();
+        const sessionIdToUse = sessionSnap.id;
+        const sessionRefToUse = sessionSnap.ref;
         const status = typeof data.status === "string" ? data.status.toUpperCase() : "";
         console.log("🔁 Confirming session with status:", status);
         const isRecoverable = status === "PENDING" || status === "EXPIRED";
@@ -896,10 +922,9 @@ app.post("/api/parking/confirm-session", async (req, res) => {
                 ? Number((zoneData.rate_per_hour / 60).toFixed(6))
                 : 0;
 
-        await sessionRef.update({
+        await sessionRefToUse.update({
             status: "ACTIVE",
             started_at: admin.firestore.FieldValue.serverTimestamp(),
-            arrival_time: admin.firestore.FieldValue.serverTimestamp(),
             activated_at: admin.firestore.FieldValue.serverTimestamp(),
             rate_per_minute: ratePerMinute,
             regulation_type: zoneData.regulation_type,
@@ -909,7 +934,7 @@ app.post("/api/parking/confirm-session", async (req, res) => {
             total_minutes: 0
         });
 
-        console.log("✅ Session confirmed:", sessionId);
+        console.log("✅ Session confirmed:", sessionIdToUse);
 
         if (data.zone_id) {
             const zoneRef =
@@ -945,7 +970,7 @@ app.post("/api/parking/confirm-session", async (req, res) => {
             console.error("Parking started email failed:", e);
         }
 
-        return res.json({ success: true, sessionId });
+        return res.json({ success: true, sessionId: sessionIdToUse });
     } catch (err) {
         console.error("Failed to confirm parking session:", err);
         return res.status(500).json({ error: "Failed to confirm session" });
