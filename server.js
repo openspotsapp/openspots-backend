@@ -8,6 +8,11 @@ import { fileURLToPath } from "url";
 import { getSpotStatus } from "./backend/spotStatus.js";
 import { amqpEvents, liveSpotCache } from "./backend/amqpClient.js";
 import { sendEmail, buildWelcomeEmail, buildPaymentMethodAddedEmail, buildReservationConfirmationEmail, buildParkingStartedEmail, buildParkingReceiptEmail, buildParkingCancelledEmail } from "./backend/email.js";
+import {
+  notifyReservationConfirmed,
+  notifySessionStarted,
+  notifySessionCompleted
+} from "./server/notifications/notificationEngine.js";
 import Stripe from "stripe";
 import crypto from "crypto";
 
@@ -352,6 +357,19 @@ app.post(
               });
 
               console.log("✅ Parking session completed:", parkingSessionId);
+              try {
+                const userId = sessionData.user_id?.id || sessionData.user_id;
+
+                await notifySessionCompleted(
+                  userId,
+                  sessionData.zone_number,
+                  parkingSessionId,
+                  totalMinutes,
+                  totalAmount
+                );
+              } catch (e) {
+                console.error("Push failed (session completed):", e);
+              }
 
               // 📧 SEND RECEIPT EMAIL
               const userRef = sessionData.user_id;
@@ -542,6 +560,11 @@ app.post(
           }
 
           console.log("✅ Reservation created & spot locked");
+          try {
+            await notifyReservationConfirmed(userId, reservationRef.id);
+          } catch (e) {
+            console.error("Push failed (reservation):", e);
+          }
           if (reservationEmailData) {
             try {
               const userSnap = await db.collection("users").doc(userId).get();
@@ -999,6 +1022,17 @@ app.post("/api/parking/confirm-session", async (req, res) => {
         });
 
         console.log("✅ Session confirmed:", sessionIdToUse);
+        try {
+            const userId = data.user_id?.id || data.user_id;
+
+            await notifySessionStarted(
+                userId,
+                data.zone_number,
+                sessionIdToUse
+            );
+        } catch (e) {
+            console.error("Push failed (session started):", e);
+        }
 
         if (data.zone_id) {
             const zoneRef =
