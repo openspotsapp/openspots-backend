@@ -41,7 +41,8 @@ app.use(cors({
   methods: ["GET", "POST"],
   allowedHeaders: ["Content-Type"]
 }));
-const PORT = process.env.PORT || 5500;
+const PORT = process.env.PORT;
+console.log("Using PORT:", PORT);
 const SOCIALS = [
   { href: "mailto:support@openspots.app", img: "https://storage.googleapis.com/flutterflow-io-6f20.appspot.com/projects/open-spots-app-977ima/assets/bn5b41rovg31/badge_email.png", alt: "Email" },
   { href: "https://facebook.com/OpenSpotsApp", img: "https://storage.googleapis.com/flutterflow-io-6f20.appspot.com/projects/open-spots-app-977ima/assets/yp5p4pvic5zc/badge_facebok.png", alt: "Facebook" },
