@@ -896,10 +896,36 @@ app.post("/api/parking/confirm-session", async (req, res) => {
             for (const d of [...fallbackByRef.docs, ...fallbackByUid.docs]) {
                 candidatesMap.set(d.id, d);
             }
-            const candidates = Array.from(candidatesMap.values()).filter((d) => {
+            let candidates = Array.from(candidatesMap.values()).filter((d) => {
                 const s = typeof d.data()?.status === "string" ? d.data().status.toUpperCase() : "";
                 return s === "PENDING" || s === "EXPIRED";
             });
+
+            // If zone-based fallback failed (stale zone in client route), recover latest by user only.
+            if (candidates.length === 0) {
+                const [userOnlyByRef, userOnlyByUid] = await Promise.all([
+                    db
+                        .collection("parking_sessions")
+                        .where("user_id", "==", userRef)
+                        .limit(30)
+                        .get(),
+                    db
+                        .collection("parking_sessions")
+                        .where("user_id", "==", user_id)
+                        .limit(30)
+                        .get(),
+                ]);
+
+                const userOnlyMap = new Map();
+                for (const d of [...userOnlyByRef.docs, ...userOnlyByUid.docs]) {
+                    userOnlyMap.set(d.id, d);
+                }
+
+                candidates = Array.from(userOnlyMap.values()).filter((d) => {
+                    const s = typeof d.data()?.status === "string" ? d.data().status.toUpperCase() : "";
+                    return s === "PENDING" || s === "EXPIRED";
+                });
+            }
 
             candidates.sort((a, b) => {
                 const ad = a.data() || {};
@@ -925,7 +951,10 @@ app.post("/api/parking/confirm-session", async (req, res) => {
             const fallbackDoc = candidates[0];
             sessionSnap = fallbackDoc;
 
-            console.log("♻️ Fallback session recovered:", fallbackDoc.id);
+            console.log("♻️ Fallback session recovered:", {
+                sessionId: fallbackDoc.id,
+                zone_number: fallbackDoc.data()?.zone_number ?? null,
+            });
         }
 
         const data = sessionSnap.data();
