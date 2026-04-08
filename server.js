@@ -873,21 +873,56 @@ app.post("/api/parking/confirm-session", async (req, res) => {
                 return res.status(404).json({ error: "Session not found and no fallback data" });
             }
 
-            const fallbackQuery = await db
-                .collection("parking_sessions")
-                .where("user_id", "==", db.collection("users").doc(user_id))
-                .where("zone_number", "==", zone_number)
-                .where("status", "in", ["PENDING", "EXPIRED"])
-                .orderBy("created_at", "desc")
-                .limit(1)
-                .get();
+            const userRef = db.collection("users").doc(user_id);
 
-            if (fallbackQuery.empty) {
+            // Avoid brittle query combinations (in + orderBy) that can throw index/precondition errors.
+            // Query broadly by user + zone, then filter/sort in memory.
+            const [fallbackByRef, fallbackByUid] = await Promise.all([
+                db
+                    .collection("parking_sessions")
+                    .where("user_id", "==", userRef)
+                    .where("zone_number", "==", zone_number)
+                    .limit(20)
+                    .get(),
+                db
+                    .collection("parking_sessions")
+                    .where("user_id", "==", user_id)
+                    .where("zone_number", "==", zone_number)
+                    .limit(20)
+                    .get(),
+            ]);
+
+            const candidatesMap = new Map();
+            for (const d of [...fallbackByRef.docs, ...fallbackByUid.docs]) {
+                candidatesMap.set(d.id, d);
+            }
+            const candidates = Array.from(candidatesMap.values()).filter((d) => {
+                const s = typeof d.data()?.status === "string" ? d.data().status.toUpperCase() : "";
+                return s === "PENDING" || s === "EXPIRED";
+            });
+
+            candidates.sort((a, b) => {
+                const ad = a.data() || {};
+                const bd = b.data() || {};
+                const aTs =
+                    ad.pending_started_at?.toMillis?.() ??
+                    ad.created_at?.toMillis?.() ??
+                    ad.expired_at?.toMillis?.() ??
+                    0;
+                const bTs =
+                    bd.pending_started_at?.toMillis?.() ??
+                    bd.created_at?.toMillis?.() ??
+                    bd.expired_at?.toMillis?.() ??
+                    0;
+                return bTs - aTs;
+            });
+
+            if (candidates.length === 0) {
                 console.error("❌ Fallback also failed");
                 return res.status(404).json({ error: "Session not found" });
             }
 
-            const fallbackDoc = fallbackQuery.docs[0];
+            const fallbackDoc = candidates[0];
             sessionSnap = fallbackDoc;
 
             console.log("♻️ Fallback session recovered:", fallbackDoc.id);
