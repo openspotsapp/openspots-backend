@@ -248,6 +248,9 @@ setInterval(async () => {
 
 // Serve PUBLIC folder
 app.use(express.static(path.join(__dirname, "public")));
+app.get("/", (req, res) => {
+  res.send("OpenSpots backend is running");
+});
 
 app.get("/auth-action", (req, res) => {
   res.sendFile(path.join(__dirname, "public", "auth-action.html"));
