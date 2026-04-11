@@ -639,6 +639,30 @@ app.get("/ping", (req, res) => {
   res.status(200).send("pong");
 });
 
+app.post("/test-push", async (req, res) => {
+    const { token } = req.body || {};
+
+    if (!token || typeof token !== "string") {
+        return res.status(400).send("Missing or invalid token");
+    }
+
+    try {
+        const response = await admin.messaging().send({
+            token,
+            notification: {
+                title: "🚀 OpenSpots Test",
+                body: "If you see this, push is working",
+            },
+        });
+
+        console.log("Push success:", response);
+        return res.send("Sent");
+    } catch (err) {
+        console.error("Push error:", err);
+        return res.status(500).send(err?.message || "Push send failed");
+    }
+});
+
 app.get("/test-welcome-email", async (req, res) => {
   try {
     const email = buildWelcomeEmail({
