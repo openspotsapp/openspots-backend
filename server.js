@@ -9,6 +9,7 @@ import { getSpotStatus } from "./backend/spotStatus.js";
 import { amqpEvents, liveSpotCache } from "./backend/amqpClient.js";
 import { sendEmail, buildWelcomeEmail, buildPaymentMethodAddedEmail, buildReservationConfirmationEmail, buildParkingStartedEmail, buildParkingReceiptEmail, buildParkingCancelledEmail } from "./backend/email.js";
 import {
+  notifySessionEndingSoon,
   notifyReservationConfirmed,
   notifySessionStarted,
   notifySessionCompleted
@@ -157,6 +158,64 @@ const ACTIVE_SESSION_INTERVAL = 60 * 1000; // 1 min
 const PENDING_SESSION_INTERVAL = 1000; // 1 sec
 const CONFIRM_WINDOW_MS = 30_000;
 
+const getDocPath = (value) => {
+  if (!value) return null;
+  if (typeof value === "string") return value;
+  if (typeof value.path === "string") return value.path;
+  return null;
+};
+
+const getUserIdValue = (value) => {
+  if (!value) return null;
+  if (typeof value === "string") return value;
+  if (typeof value.id === "string") return value.id;
+  return null;
+};
+
+const getNumericField = (source, keys) => {
+  if (!source) return null;
+
+  for (const key of keys) {
+    const raw = source[key];
+    const parsed = Number(raw);
+    if (Number.isFinite(parsed) && parsed > 0) {
+      return parsed;
+    }
+  }
+
+  return null;
+};
+
+const parseDurationFromString = (value) => {
+  if (typeof value !== "string") return null;
+
+  const match = value.match(/(\d+)\s*(min|mins|minute|minutes|hr|hrs|hour|hours)/i);
+  if (!match) return null;
+
+  const amount = Number(match[1]);
+  if (!Number.isFinite(amount) || amount <= 0) return null;
+
+  const unit = match[2].toLowerCase();
+  return unit.startsWith("h") ? amount * 60 : amount;
+};
+
+const getSessionLimitMinutes = (sessionData, zoneData) => {
+  const keys = [
+    "duration_minutes",
+    "max_minutes",
+    "time_limit_minutes",
+    "session_length_minutes",
+    "minutes_allowed",
+  ];
+
+  return (
+    getNumericField(sessionData, keys) ||
+    getNumericField(zoneData, keys) ||
+    parseDurationFromString(sessionData?.regulation_type) ||
+    parseDurationFromString(zoneData?.regulation_type)
+  );
+};
+
 setInterval(async () => {
   try {
     const now = admin.firestore.Timestamp.now();
@@ -168,19 +227,65 @@ setInterval(async () => {
 
     for (const docSnap of activeSessions.docs) {
       const data = docSnap.data();
-      if (!data.arrival_time || typeof data.rate_per_minute !== "number") {
+      if (!data.arrival_time) {
         continue;
       }
 
       const start = data.arrival_time.toDate();
       const minutes = Math.floor((Date.now() - start.getTime()) / 60000);
-      const price = Number((minutes * data.rate_per_minute).toFixed(2));
-
-      await docSnap.ref.update({
+      const updatePayload = {
         total_minutes: minutes,
-        price_charged: price,
-        last_updated: now
-      });
+        last_updated: now,
+      };
+
+      if (typeof data.rate_per_minute === "number") {
+        updatePayload.price_charged = Number(
+          (minutes * data.rate_per_minute).toFixed(2)
+        );
+      }
+
+      await docSnap.ref.update(updatePayload);
+
+      if (data.status !== "ACTIVE" || data.endingSoonNotified === true) {
+        continue;
+      }
+
+      const zoneRef =
+        typeof data.zone_id === "string" ? db.doc(data.zone_id) : data.zone_id;
+      let zoneData = null;
+
+      if (zoneRef) {
+        try {
+          const zoneSnap = await zoneRef.get();
+          zoneData = zoneSnap.exists ? zoneSnap.data() || {} : null;
+        } catch (err) {
+          console.error("Failed to load zone for ending-soon check:", err);
+        }
+      }
+
+      const sessionLimitMinutes = getSessionLimitMinutes(data, zoneData);
+      if (!sessionLimitMinutes) {
+        continue;
+      }
+
+      const remainingMinutes = sessionLimitMinutes - minutes;
+      if (remainingMinutes > 10) {
+        continue;
+      }
+
+      const userId = getUserIdValue(data.user_id);
+      const zoneId = getDocPath(data.zone_id);
+
+      try {
+        await notifySessionEndingSoon(userId, zoneId, docSnap.id);
+        console.log("Push: session_ending_soon", docSnap.id);
+        await docSnap.ref.update({
+          endingSoonNotified: true,
+          endingSoonNotifiedAt: admin.firestore.FieldValue.serverTimestamp(),
+        });
+      } catch (err) {
+        console.error("Push failed (session_ending_soon):", err);
+      }
     }
   } catch (err) {
     console.error("Failed to update active sessions:", err);
@@ -229,7 +334,8 @@ setInterval(async () => {
       if (occupied) {
         await docSnap.ref.update({
           status: "ACTIVE",
-          activated_at: admin.firestore.FieldValue.serverTimestamp()
+          activated_at: admin.firestore.FieldValue.serverTimestamp(),
+          endingSoonNotified: false,
         });
       } else {
         // Do not hard-delete pending sessions here. Deletions cause confirm-session 404 races.
@@ -357,22 +463,25 @@ app.post(
                 ended_at: now,
                 total_minutes: totalMinutes,
                 total_amount: totalAmount,
+                price_charged: totalAmount,
                 stripe_session_id: session.id,
               });
 
               console.log("✅ Parking session completed:", parkingSessionId);
               try {
-                const userId = sessionData.user_id?.id || sessionData.user_id;
+                const userId = getUserIdValue(sessionData.user_id);
+                const zoneId = getDocPath(sessionData.zone_id);
 
                 await notifySessionCompleted(
                   userId,
-                  sessionData.zone_number,
+                  zoneId,
                   parkingSessionId,
                   totalMinutes,
                   totalAmount
                 );
+                console.log("Push: session_completed", parkingSessionId);
               } catch (e) {
-                console.error("Push failed (session completed):", e);
+                console.error("Push failed (session_completed):", e);
               }
 
               // 📧 SEND RECEIPT EMAIL
@@ -566,8 +675,9 @@ app.post(
           console.log("✅ Reservation created & spot locked");
           try {
             await notifyReservationConfirmed(userId, reservationRef.id);
+            console.log("Push: reservation_confirmed", reservationRef.id);
           } catch (e) {
-            console.error("Push failed (reservation):", e);
+            console.error("Push failed (reservation_confirmed):", e);
           }
           if (reservationEmailData) {
             try {
@@ -1046,20 +1156,23 @@ app.post("/api/parking/confirm-session", async (req, res) => {
             sensor_id: data.zone_number,
             payment_method: "MOBILE",
             price_charged: 0,
-            total_minutes: 0
+            total_minutes: 0,
+            endingSoonNotified: false
         });
 
         console.log("✅ Session confirmed:", sessionIdToUse);
         try {
-            const userId = data.user_id?.id || data.user_id;
+            const userId = getUserIdValue(data.user_id);
+            const zoneId = getDocPath(data.zone_id);
 
             await notifySessionStarted(
                 userId,
-                data.zone_number,
+                zoneId,
                 sessionIdToUse
             );
+            console.log("Push: session_started", sessionIdToUse);
         } catch (e) {
-            console.error("Push failed (session started):", e);
+            console.error("Push failed (session_started):", e);
         }
 
         if (data.zone_id) {

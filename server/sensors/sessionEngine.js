@@ -1,4 +1,8 @@
 import { createRequire } from "module";
+import {
+  notifySessionCompleted,
+  notifySessionStarted,
+} from "../notifications/notificationEngine.js";
 
 const require = createRequire(import.meta.url);
 const admin = require("firebase-admin");
@@ -36,7 +40,7 @@ export async function resolveZoneBySensorId(sensorId) {
 export async function processSensorOccupancy({ sensorId, occupied, ts }) {
   const db = getDb();
   const eventTime = admin.firestore.Timestamp.fromDate(ts);
-  return db.runTransaction(async (tx) => {
+  const result = await db.runTransaction(async (tx) => {
     const zoneQuery = db
       .collection("private_metered_parking")
       .where("sensor_id", "==", sensorId)
@@ -75,6 +79,7 @@ export async function processSensorOccupancy({ sensorId, occupied, ts }) {
         zone_id: zoneRef,
         arrival_time: eventTime,
         status: "ACTIVE",
+        endingSoonNotified: false,
         created_at: admin.firestore.FieldValue.serverTimestamp(),
       });
 
@@ -86,6 +91,8 @@ export async function processSensorOccupancy({ sensorId, occupied, ts }) {
       return {
         zoneRef,
         zoneId: zoneRef.path,
+        sessionId: newSessionRef.id,
+        userId: null,
         decision: "session_started",
       };
     }
@@ -104,10 +111,16 @@ export async function processSensorOccupancy({ sensorId, occupied, ts }) {
     const totalMinutes = arrivalAt
       ? Math.max(0, Math.floor((ts.getTime() - arrivalAt.getTime()) / 60000))
       : 0;
+    const ratePerMinute =
+      typeof sessionData.rate_per_minute === "number"
+        ? sessionData.rate_per_minute
+        : 0;
+    const priceCharged = Number((totalMinutes * ratePerMinute).toFixed(2));
 
     tx.update(sessionDoc.ref, {
       departure_time: eventTime,
       total_minutes: totalMinutes,
+      price_charged: priceCharged,
       status: "COMPLETED",
       last_updated: admin.firestore.FieldValue.serverTimestamp(),
     });
@@ -120,9 +133,41 @@ export async function processSensorOccupancy({ sensorId, occupied, ts }) {
     return {
       zoneRef,
       zoneId: zoneRef.path,
+      sessionId: sessionDoc.id,
+      userId:
+        sessionData.user_id?.id ||
+        (typeof sessionData.user_id === "string" ? sessionData.user_id : null),
+      totalMinutes,
+      priceCharged,
       decision: "session_completed",
     };
   });
+
+  if (result.decision === "session_started" && result.userId) {
+    try {
+      await notifySessionStarted(result.userId, result.zoneId, result.sessionId);
+      console.log("Push: session_started", result.sessionId);
+    } catch (err) {
+      console.error("Push failed (session_started):", err);
+    }
+  }
+
+  if (result.decision === "session_completed" && result.userId) {
+    try {
+      await notifySessionCompleted(
+        result.userId,
+        result.zoneId,
+        result.sessionId,
+        result.totalMinutes,
+        result.priceCharged
+      );
+      console.log("Push: session_completed", result.sessionId);
+    } catch (err) {
+      console.error("Push failed (session_completed):", err);
+    }
+  }
+
+  return result;
 }
 
 export function getAdmin() {

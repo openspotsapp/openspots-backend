@@ -20,6 +20,10 @@ function getDb() {
 }
 
 async function getUserNotificationContext(userId) {
+  if (!userId || typeof userId !== "string") {
+    return { canNotify: false, tokens: [] };
+  }
+
   const db = getDb();
   const userSnap = await db.collection("users").doc(userId).get();
 
@@ -89,6 +93,23 @@ export async function notifySessionCompleted(
     },
     data: {
       type: "session_completed",
+      zoneId,
+      sessionId,
+    },
+  });
+}
+
+export async function notifySessionEndingSoon(userId, zoneId, sessionId) {
+  const { canNotify, tokens } = await getUserNotificationContext(userId);
+  if (!canNotify || tokens.length === 0) return null;
+
+  return sendPushToTokens(tokens, {
+    notification: {
+      title: "Parking Ending Soon",
+      body: "Your parking session is about to end",
+    },
+    data: {
+      type: "session_ending_soon",
       zoneId,
       sessionId,
     },
