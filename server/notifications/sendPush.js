@@ -56,25 +56,31 @@ export async function sendPushToTokens(tokens, payload) {
   }
 
   const messaging = getAdmin().messaging();
+  const title = payload?.notification?.title || "";
+  const body = payload?.notification?.body || "";
+  const data = normalizeData(payload?.data || {});
   const message = {
     tokens: uniqueTokens,
-    notification: payload?.notification || {},
-    data: normalizeData(payload?.data || {}),
+    notification: {
+      title,
+      body,
+    },
+    data,
   };
 
-  const result = await messaging.sendMulticast(message);
+  const response = await messaging.sendEachForMulticast(message);
 
-  console.log("[FCM] Multicast result", {
-    successCount: result.successCount,
-    failureCount: result.failureCount,
+  console.log("[FCM] sendEachForMulticast result", {
+    successCount: response.successCount,
+    failureCount: response.failureCount,
   });
 
   const invalidTokens = [];
 
-  result.responses.forEach((response, idx) => {
+  response.responses.forEach((entry, idx) => {
     if (
-      !response.success &&
-      response.error?.code === "messaging/registration-token-not-registered"
+      !entry.success &&
+      entry.error?.code === "messaging/registration-token-not-registered"
     ) {
       invalidTokens.push(uniqueTokens[idx]);
     }
@@ -82,5 +88,5 @@ export async function sendPushToTokens(tokens, payload) {
 
   await removeInvalidTokens(invalidTokens);
 
-  return result;
+  return response;
 }
