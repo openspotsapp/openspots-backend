@@ -41,17 +41,54 @@ export const amqpEvents = new EventEmitter();
 // THE QUEUE NAME (as created by Sergi)
 // ─────────────────────────────────────────────
 const QUEUE_NAME = "OpenSpots-prj508419"; // provided by Sergi
+const EXCHANGE_NAME = null;
+const ROUTING_KEY = null;
+const QUEUE_ASSERTED = false;
+const CONSUME_OPTIONS = { noAck: true }; // passive consumption with autoACK
 
 // ─────────────────────────────────────────────
 // AMQP CONNECTION HANDLING
 // ─────────────────────────────────────────────
 let connection = null;
 let channel = null;
+let heartbeatInterval = null;
+
+function sanitizeAmqpHost(host) {
+  if (!host) {
+    return "(missing)";
+  }
+
+  try {
+    const url = new URL(host);
+    if (url.username || url.password) {
+      url.username = "[redacted]";
+      url.password = "[redacted]";
+    }
+    return url.toString();
+  } catch {
+    return host;
+  }
+}
+
+function stopHeartbeat() {
+  if (heartbeatInterval) {
+    clearInterval(heartbeatInterval);
+    heartbeatInterval = null;
+  }
+}
 
 // AUTO-RECONNECT LOOP
 async function connectAMQP() {
   try {
     console.log("🔌 [AMQP] Connecting to Urbiotica…");
+    console.log("[AMQP] Host:", sanitizeAmqpHost(AMQP_HOST));
+    console.log("[AMQP] Queue:", QUEUE_NAME);
+    console.log("[AMQP] Exchange:", EXCHANGE_NAME ?? "(none configured)");
+    console.log("[AMQP] Routing key:", ROUTING_KEY ?? "(none configured)");
+    console.log(
+      `[AMQP] Queue mode: ${QUEUE_ASSERTED ? "asserted before consume" : "only consumed; no assertQueue/bindQueue in this client"}`
+    );
+    console.log("[AMQP] Consume options:", CONSUME_OPTIONS);
 
     connection = await amqp.connect(AMQP_HOST, {
       username: USERID,
@@ -63,27 +100,50 @@ async function connectAMQP() {
     });
 
     connection.on("close", () => {
+      stopHeartbeat();
       console.warn("⚠️ [AMQP] Connection closed. Reconnecting in 3s…");
       setTimeout(connectAMQP, 3000);
     });
 
     channel = await connection.createChannel();
 
+    channel.on("error", (err) => {
+      console.error("❌ [AMQP] Channel error:", err.message);
+    });
+
+    channel.on("close", () => {
+      stopHeartbeat();
+      console.warn("⚠️ [AMQP] Channel closed.");
+    });
+
     console.log("📡 [AMQP] Connected. Subscribing to queue:", QUEUE_NAME);
 
-    await channel.consume(
+    const consumeResult = await channel.consume(
       QUEUE_NAME,
       (msg) => {
         if (msg !== null) {
           handleMessage(msg);
         }
       },
-      { noAck: true } // passive consumption with autoACK
+      CONSUME_OPTIONS
     );
 
+    console.log("[AMQP] Consumer started:", {
+      consumerTag: consumeResult.consumerTag,
+      queue: QUEUE_NAME,
+      exchange: EXCHANGE_NAME,
+      routingKey: ROUTING_KEY,
+      noAck: CONSUME_OPTIONS.noAck,
+      queueAsserted: QUEUE_ASSERTED
+    });
     console.log("🚀 [AMQP] Listening for sensor events…");
+    stopHeartbeat();
+    heartbeatInterval = setInterval(() => {
+      console.log("[AMQP] Still connected/listening...");
+    }, 60000);
 
   } catch (err) {
+    stopHeartbeat();
     console.error("❌ [AMQP] Connection failed:", err.message);
     console.log("⏳ Retrying in 3 seconds…");
     setTimeout(connectAMQP, 3000);
