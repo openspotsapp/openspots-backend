@@ -1,10 +1,18 @@
 export function normalizeSensorPayload(payload) {
   const raw = payload || {};
 
-  const sensorIdRaw = raw.sensor_id ?? raw.sensorId ?? raw.element;
+  const pomId = normalizeId(raw.pomId ?? raw.pom_id ?? raw.pom?.id ?? raw.device?.pomId);
+  const elementId = normalizeId(raw.elementId ?? raw.element_id ?? raw.element?.id ?? raw.element);
+  const measurementPointId = normalizeId(
+    raw.measurementPointId ?? raw.measurement_point_id ?? raw.measurementPoint?.id
+  );
+  const locationId = normalizeId(raw.locationId ?? raw.location_id ?? raw.location?.id);
+  const zoneNumber = normalizeId(raw.zone_number ?? raw.zoneNumber);
+  const spotNumber = normalizeId(raw.spot_number ?? raw.spotNumber);
+  const sensorIdRaw = raw.sensor_id ?? raw.sensorId ?? zoneNumber ?? spotNumber ?? elementId ?? pomId ?? measurementPointId;
   const sensorId = typeof sensorIdRaw === "string" ? sensorIdRaw.trim() : String(sensorIdRaw || "").trim();
 
-  const occupied = normalizeOccupied(raw.occupied ?? raw.value ?? raw.status);
+  const occupied = normalizeOccupied(raw.vehiclePresence ?? raw.vehicle_presence ?? raw.occupied ?? raw.value ?? raw.status);
   const ts = normalizeTimestamp(raw.ts ?? raw.timestamp ?? raw.time);
 
   if (!sensorId) {
@@ -20,11 +28,22 @@ export function normalizeSensorPayload(payload) {
     reason: null,
     normalized: {
       sensorId,
+      pomId,
+      elementId,
+      measurementPointId,
+      locationId,
+      zoneNumber,
+      spotNumber,
       occupied,
       ts,
       raw,
     },
   };
+}
+
+function normalizeId(value) {
+  if (value === undefined || value === null) return "";
+  return String(value).trim();
 }
 
 function normalizeOccupied(value) {
@@ -33,8 +52,8 @@ function normalizeOccupied(value) {
 
   if (typeof value === "string") {
     const lowered = value.trim().toLowerCase();
-    if (["1", "true", "occupied", "busy", "on"].includes(lowered)) return true;
-    if (["0", "false", "free", "available", "off"].includes(lowered)) return false;
+    if (["1", "true", "occupied", "busy", "on", "presence", "present"].includes(lowered)) return true;
+    if (["0", "false", "free", "available", "vacant", "empty", "off", "absence", "absent"].includes(lowered)) return false;
   }
 
   return undefined;

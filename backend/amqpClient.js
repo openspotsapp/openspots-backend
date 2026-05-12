@@ -93,9 +93,43 @@ async function connectAMQP() {
 // ─────────────────────────────────────────────
 // MESSAGE HANDLER — parses & stores each event
 // ─────────────────────────────────────────────
+function firstPresent(...values) {
+  return values.find((value) => value !== undefined && value !== null && value !== "");
+}
+
+function extractDebugIdentifiers(payload) {
+  return {
+    pomId: firstPresent(payload.pomId, payload.pom_id, payload.pom?.id, payload.device?.pomId),
+    elementId: firstPresent(payload.elementId, payload.element_id, payload.element?.id, payload.element),
+    measurementPointId: firstPresent(
+      payload.measurementPointId,
+      payload.measurement_point_id,
+      payload.measurementPoint?.id
+    ),
+    locationId: firstPresent(payload.locationId, payload.location_id, payload.location?.id),
+    vehiclePresence: firstPresent(
+      payload.vehiclePresence,
+      payload.vehicle_presence,
+      payload.occupied,
+      payload.value,
+      payload.status
+    ),
+  };
+}
+
 function handleMessage(msg) {
+  const rawMessage = msg.content.toString();
+  console.log("[AMQP] Raw message:", rawMessage);
+
   try {
-    const payload = JSON.parse(msg.content.toString());
+    const payload = JSON.parse(rawMessage);
+    if (!payload || typeof payload !== "object") {
+      console.warn("[AMQP] Parsed message is not an object");
+      return;
+    }
+
+    const debugIdentifiers = extractDebugIdentifiers(payload);
+    console.log("[AMQP] Extracted identifiers:", debugIdentifiers);
 
     // Urbiotica standard format example:
     // {
@@ -105,8 +139,13 @@ function handleMessage(msg) {
     //   "timestamp": "2024-12-04T15:22:11Z"
     // }
 
-    const elementId = payload.element;
-    const statusValue = payload.value;
+    const elementId =
+      debugIdentifiers.elementId ??
+      debugIdentifiers.pomId ??
+      debugIdentifiers.measurementPointId ??
+      payload.sensor_id ??
+      payload.sensorId;
+    const statusValue = debugIdentifiers.vehiclePresence;
     const ts = payload.timestamp || Date.now();
 
     // Update local cache

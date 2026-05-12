@@ -24,30 +24,67 @@ function getDb() {
 
 export async function resolveZoneBySensorId(sensorId) {
   const db = getDb();
-  const zoneSnap = await db
-    .collection("private_metered_parking")
-    .where("sensor_id", "==", sensorId)
-    .limit(1)
-    .get();
+  const zoneDoc = await resolvePrivateMeteredParkingDoc(db, { sensorId });
 
-  if (zoneSnap.empty) {
+  if (!zoneDoc) {
     return null;
   }
 
-  return zoneSnap.docs[0];
+  return zoneDoc;
 }
 
-export async function processSensorOccupancy({ sensorId, occupied, ts }) {
+async function getFirstMatchingDoc(tx, query) {
+  const snap = await tx.get(query.limit(1));
+  return snap.empty ? null : snap.docs[0];
+}
+
+function queryValues(value) {
+  if (value === undefined || value === null || value === "") return [];
+
+  const values = [value];
+  const numericValue = Number(value);
+  if (typeof value === "string" && value.trim() !== "" && !Number.isNaN(numericValue)) {
+    values.push(numericValue);
+  }
+
+  return values;
+}
+
+async function resolvePrivateMeteredParkingDoc(db, identifiers, tx = null) {
+  const collection = db.collection("private_metered_parking");
+  const matches = [
+    ["urbiotica_pom_id", identifiers.pomId],
+    ["urbiotica_element_id", identifiers.elementId],
+    ["sensor_id", identifiers.sensorId],
+    ["zone_number", identifiers.zoneNumber],
+    ["spot_number", identifiers.spotNumber],
+  ];
+
+  for (const [field, identifier] of matches) {
+    for (const value of queryValues(identifier)) {
+      const query = collection.where(field, "==", value);
+      const doc = tx ? await getFirstMatchingDoc(tx, query) : (await query.limit(1).get()).docs[0] ?? null;
+      if (doc) {
+        return doc;
+      }
+    }
+  }
+
+  return null;
+}
+
+export async function processSensorOccupancy({ sensorId, occupied, ts, identifiers = {} }) {
   const db = getDb();
   const eventTime = admin.firestore.Timestamp.fromDate(ts);
   const result = await db.runTransaction(async (tx) => {
-    const zoneQuery = db
-      .collection("private_metered_parking")
-      .where("sensor_id", "==", sensorId)
-      .limit(1);
-    const zoneSnap = await tx.get(zoneQuery);
+    const zoneDoc = await resolvePrivateMeteredParkingDoc(
+      db,
+      { ...identifiers, sensorId },
+      tx
+    );
 
-    if (zoneSnap.empty) {
+    if (!zoneDoc) {
+      console.log("[AMQP] No matching private_metered_parking document found");
       return {
         zoneRef: null,
         zoneId: null,
@@ -55,7 +92,6 @@ export async function processSensorOccupancy({ sensorId, occupied, ts }) {
       };
     }
 
-    const zoneDoc = zoneSnap.docs[0];
     const zoneRef = zoneDoc.ref;
     const activeQuery = db
       .collection("parking_sessions")
@@ -65,6 +101,15 @@ export async function processSensorOccupancy({ sensorId, occupied, ts }) {
     const activeSnap = await tx.get(activeQuery);
 
     if (occupied === true) {
+      tx.update(zoneRef, {
+        is_available: false,
+        sensor_status: "occupied",
+        last_sensor_seen_at: admin.firestore.FieldValue.serverTimestamp(),
+        last_updated: admin.firestore.FieldValue.serverTimestamp(),
+      });
+
+      console.log("[AMQP] Sensor occupied -> Firestore updated");
+
       if (!activeSnap.empty) {
         return {
           zoneRef,
@@ -83,11 +128,6 @@ export async function processSensorOccupancy({ sensorId, occupied, ts }) {
         created_at: admin.firestore.FieldValue.serverTimestamp(),
       });
 
-      tx.update(zoneRef, {
-        is_available: false,
-        last_updated: admin.firestore.FieldValue.serverTimestamp(),
-      });
-
       return {
         zoneRef,
         zoneId: zoneRef.path,
@@ -96,6 +136,15 @@ export async function processSensorOccupancy({ sensorId, occupied, ts }) {
         decision: "session_started",
       };
     }
+
+    tx.update(zoneRef, {
+      is_available: true,
+      sensor_status: "available",
+      last_sensor_seen_at: admin.firestore.FieldValue.serverTimestamp(),
+      last_updated: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    console.log("[AMQP] Sensor available -> Firestore updated");
 
     if (activeSnap.empty) {
       return {
@@ -122,11 +171,6 @@ export async function processSensorOccupancy({ sensorId, occupied, ts }) {
       total_minutes: totalMinutes,
       price_charged: priceCharged,
       status: "COMPLETED",
-      last_updated: admin.firestore.FieldValue.serverTimestamp(),
-    });
-
-    tx.update(zoneRef, {
-      is_available: true,
       last_updated: admin.firestore.FieldValue.serverTimestamp(),
     });
 

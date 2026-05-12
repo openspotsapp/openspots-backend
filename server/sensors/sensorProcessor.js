@@ -20,10 +20,10 @@ export async function sensorProcessor(payload) {
     return { decision: reason };
   }
 
-  const { sensorId, occupied, ts, raw } = normalized;
+  const { sensorId, occupied, ts, raw, ...identifiers } = normalized;
   let result;
   try {
-    result = await processSensorOccupancy({ sensorId, occupied, ts });
+    result = await processSensorOccupancy({ sensorId, occupied, ts, identifiers });
   } catch (err) {
     result = {
       zoneRef: null,
