@@ -3,6 +3,7 @@ dotenv.config();
 // backend/amqpClient.js
 import amqp from "amqplib";
 import EventEmitter from "events";
+import os from "os";
 import { sensorProcessor } from "../server/sensors/sensorProcessor.js";
 
 // ─────────────────────────────────────────────
@@ -45,6 +46,17 @@ const EXCHANGE_NAME = null;
 const ROUTING_KEY = null;
 const QUEUE_ASSERTED = false;
 const CONSUME_OPTIONS = { noAck: true }; // passive consumption with autoACK
+const AMQP_CONSUMER_ENABLED = process.env.AMQP_CONSUMER_ENABLED === "true";
+
+function getRenderRuntimeContext() {
+  return {
+    render: process.env.RENDER ?? null,
+    serviceId: process.env.RENDER_SERVICE_ID ?? null,
+    serviceName: process.env.RENDER_SERVICE_NAME ?? null,
+    instanceId: process.env.RENDER_INSTANCE_ID ?? null,
+    externalHostname: process.env.RENDER_EXTERNAL_HOSTNAME ?? null,
+  };
+}
 
 // ─────────────────────────────────────────────
 // AMQP CONNECTION HANDLING
@@ -117,6 +129,15 @@ async function connectAMQP() {
     });
 
     console.log("📡 [AMQP] Connected. Subscribing to queue:", QUEUE_NAME);
+    console.log("[AMQP] Starting consume()", {
+      pid: process.pid,
+      nodeEnv: process.env.NODE_ENV ?? null,
+      queue: QUEUE_NAME,
+      hostname: os.hostname(),
+      render: getRenderRuntimeContext(),
+      amqpConsumerEnabled: AMQP_CONSUMER_ENABLED,
+      timestamp: new Date().toISOString(),
+    });
 
     const consumeResult = await channel.consume(
       QUEUE_NAME,
@@ -241,7 +262,11 @@ function handleMessage(msg) {
 // ─────────────────────────────────────────────
 // START CLIENT
 // ─────────────────────────────────────────────
-connectAMQP();
+if (AMQP_CONSUMER_ENABLED) {
+  connectAMQP();
+} else {
+  console.log("[AMQP] Consumer disabled by AMQP_CONSUMER_ENABLED");
+}
 
 // Export channel if needed
 export default {
