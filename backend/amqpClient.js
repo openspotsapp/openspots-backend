@@ -178,22 +178,78 @@ function firstPresent(...values) {
   return values.find((value) => value !== undefined && value !== null && value !== "");
 }
 
+function firstMeasure(payload) {
+  return Array.isArray(payload.measures) ? payload.measures[0] : undefined;
+}
+
+function parseVehiclePresence(value) {
+  if (value === true || value === 1) return true;
+  if (value === false || value === 0) return false;
+
+  if (typeof value === "string") {
+    const normalized = value.trim().toLowerCase();
+    if (normalized === "1" || normalized === "true") return true;
+    if (normalized === "0" || normalized === "false") return false;
+  }
+
+  return undefined;
+}
+
+function parseBatteryVoltage(value) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+function normalizeUrbioticaPayload(payload) {
+  const phenomenon = firstPresent(payload.phenomenonid, payload.phenomenon);
+  const measure = firstMeasure(payload);
+  const normalized = {
+    ...payload,
+    phenomenon,
+    pomId: firstPresent(payload.pom, payload.pomId, payload.pom_id),
+    elementId: firstPresent(payload.elementid, payload.elementId, payload.element_id),
+    measurementPointId: firstPresent(payload.pom, payload.measurementPointId, payload.measurement_point_id),
+    locationId: firstPresent(payload.zoneid, payload.locationId, payload.location_id),
+    zoneId: firstPresent(payload.zoneid, payload.zoneId, payload.zone_id),
+    description: firstPresent(payload.pomdesc, payload.description),
+    latitude: firstPresent(payload.latitude),
+    longitude: firstPresent(payload.longitude),
+  };
+
+  if (phenomenon === "vehicle") {
+    normalized.vehiclePresence = parseVehiclePresence(measure);
+  }
+
+  if (phenomenon === "node_battery") {
+    normalized.batteryVoltage = parseBatteryVoltage(measure);
+  }
+
+  return normalized;
+}
+
 function extractDebugIdentifiers(payload) {
   return {
-    pomId: firstPresent(payload.pomId, payload.pom_id, payload.pom?.id, payload.device?.pomId),
-    elementId: firstPresent(payload.elementId, payload.element_id, payload.element?.id, payload.element),
+    pomId: firstPresent(payload.pomId, payload.pom_id, payload.pom?.id, payload.device?.pomId, payload.pom),
+    elementId: firstPresent(payload.elementId, payload.element_id, payload.element?.id, payload.element, payload.elementid),
     measurementPointId: firstPresent(
       payload.measurementPointId,
       payload.measurement_point_id,
-      payload.measurementPoint?.id
+      payload.measurementPoint?.id,
+      payload.pom
     ),
-    locationId: firstPresent(payload.locationId, payload.location_id, payload.location?.id),
+    locationId: firstPresent(payload.locationId, payload.location_id, payload.location?.id, payload.zoneid, payload.zoneId),
+    zoneId: firstPresent(payload.zoneId, payload.zone_id, payload.zoneid),
+    description: firstPresent(payload.description, payload.pomdesc),
+    latitude: firstPresent(payload.latitude),
+    longitude: firstPresent(payload.longitude),
+    batteryVoltage: firstPresent(payload.batteryVoltage),
     vehiclePresence: firstPresent(
       payload.vehiclePresence,
       payload.vehicle_presence,
       payload.occupied,
       payload.value,
-      payload.status
+      payload.status,
+      payload.phenomenonid === "vehicle" ? parseVehiclePresence(firstMeasure(payload)) : undefined
     ),
   };
 }
@@ -209,7 +265,8 @@ function handleMessage(msg) {
       return;
     }
 
-    const debugIdentifiers = extractDebugIdentifiers(payload);
+    const normalizedPayload = normalizeUrbioticaPayload(payload);
+    const debugIdentifiers = extractDebugIdentifiers(normalizedPayload);
     console.log("[AMQP] Extracted identifiers:", debugIdentifiers);
 
     // Urbiotica standard format example:
@@ -228,12 +285,14 @@ function handleMessage(msg) {
       payload.sensorId;
     const statusValue = debugIdentifiers.vehiclePresence;
     const ts = payload.timestamp || Date.now();
+    const phenomenon = normalizedPayload.phenomenon;
 
     // Update local cache
     liveSpotCache[elementId] = {
       status: statusValue,
       ts,
-      phenomenon: payload.phenomenon,
+      phenomenon,
+      batteryVoltage: debugIdentifiers.batteryVoltage,
       raw: payload
     };
 
@@ -242,17 +301,28 @@ function handleMessage(msg) {
       elementId,
       status: statusValue,
       timestamp: ts,
-      phenomenon: payload.phenomenon,
+      phenomenon,
+      batteryVoltage: debugIdentifiers.batteryVoltage,
       raw: payload
     });
 
-    sensorProcessor(payload).catch((err) => {
+    sensorProcessor(normalizedPayload).catch((err) => {
       console.error("❌ [SENSOR] Processing error:", err.message);
     });
 
-    console.log(
-      `📨 [AMQP] ${elementId} → ${payload.phenomenon}: ${statusValue}`
-    );
+    if (phenomenon === "vehicle") {
+      console.log(
+        `[AMQP] vehicle ${debugIdentifiers.description ?? "(no description)"} / pom ${debugIdentifiers.measurementPointId ?? "(unknown)"} / zone ${debugIdentifiers.zoneId ?? "(unknown)"} -> occupied=${statusValue}`
+      );
+    } else if (phenomenon === "node_battery") {
+      console.log(
+        `[AMQP] node_battery ${debugIdentifiers.description ?? "(no description)"} / pom ${debugIdentifiers.measurementPointId ?? "(unknown)"} / zone ${debugIdentifiers.zoneId ?? "(unknown)"} -> batteryVoltage=${debugIdentifiers.batteryVoltage}`
+      );
+    } else {
+      console.log(
+        `📨 [AMQP] ${elementId} → ${phenomenon}: ${statusValue}`
+      );
+    }
 
   } catch (err) {
     console.error("❌ [AMQP] Message parse error:", err);
