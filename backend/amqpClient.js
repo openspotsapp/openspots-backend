@@ -201,11 +201,13 @@ function parseBatteryVoltage(value) {
 }
 
 function normalizeUrbioticaPayload(payload) {
-  const phenomenon = firstPresent(payload.phenomenonid, payload.phenomenon);
+  const phenomenon = firstPresent(payload.phenomenonid, payload.phenomenonId, payload.phenomenon);
   const measure = firstMeasure(payload);
   const normalized = {
     ...payload,
     phenomenon,
+    phenomenonId: phenomenon,
+    sensorProvider: "urbiotica",
     pomId: firstPresent(payload.pom, payload.pomId, payload.pom_id),
     elementId: firstPresent(payload.elementid, payload.elementId, payload.element_id),
     measurementPointId: firstPresent(payload.pom, payload.measurementPointId, payload.measurement_point_id),
