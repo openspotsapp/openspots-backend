@@ -216,6 +216,182 @@ const getSessionLimitMinutes = (sessionData, zoneData) => {
   );
 };
 
+const resolveDocRef = (value) => {
+  if (!value) return null;
+  if (typeof value === "string") return db.doc(value);
+  if (typeof value.path === "string") return value;
+  return null;
+};
+
+const uniqueByKey = (values, keyFn) => {
+  const seen = new Set();
+  return values.filter((value) => {
+    if (!value) return false;
+    const key = keyFn(value);
+    if (!key || seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+};
+
+const getZoneQueryValues = (zoneRef) => {
+  if (!zoneRef) return [];
+  return uniqueByKey(
+    [zoneRef, zoneRef.path],
+    (value) => typeof value === "string" ? `string:${value}` : `ref:${getDocPath(value)}`
+  );
+};
+
+const sameUser = (a, b) => {
+  const aPath = getDocPath(a);
+  const bPath = getDocPath(b);
+  if (aPath && bPath) return aPath === bPath;
+  return getUserIdValue(a) === getUserIdValue(b);
+};
+
+const findActiveSessionForUserZone = async (tx, { targetSessionId, userValue, zoneRef }) => {
+  const zoneValues = getZoneQueryValues(zoneRef);
+  const candidates = new Map();
+
+  for (const zoneValue of zoneValues) {
+    const snap = await tx.get(
+      db
+        .collection("parking_sessions")
+        .where("status", "==", "ACTIVE")
+        .where("zone_id", "==", zoneValue)
+        .limit(20)
+    );
+
+    for (const docSnap of snap.docs) {
+      candidates.set(docSnap.id, docSnap);
+    }
+  }
+
+  for (const docSnap of candidates.values()) {
+    const activeData = docSnap.data() || {};
+    if (docSnap.id !== targetSessionId && sameUser(activeData.user_id, userValue)) {
+      return docSnap;
+    }
+  }
+
+  return null;
+};
+
+async function activateParkingSession({ sessionRef, source }) {
+  console.log("[PARKING] Activation requested", {
+    sessionId: sessionRef.id,
+    source,
+  });
+
+  const result = await db.runTransaction(async (tx) => {
+    const sessionSnap = await tx.get(sessionRef);
+
+    if (!sessionSnap.exists) {
+      const err = new Error("Session not found");
+      err.code = "session_not_found";
+      throw err;
+    }
+
+    const data = sessionSnap.data() || {};
+    const status = typeof data.status === "string" ? data.status.toUpperCase() : "";
+    const zoneRef = resolveDocRef(data.zone_id);
+
+    if (status === "ACTIVE") {
+      console.log("[PARKING] Session already active", {
+        sessionId: sessionSnap.id,
+        source,
+      });
+      return {
+        sessionId: sessionSnap.id,
+        sessionData: data,
+        zoneData: {},
+        alreadyActive: true,
+        activated: false,
+        duplicateActivePrevented: false,
+      };
+    }
+
+    if (status !== "PENDING" && status !== "EXPIRED") {
+      const err = new Error("Session is not recoverable");
+      err.code = "session_not_recoverable";
+      err.status = status;
+      throw err;
+    }
+
+    if (!zoneRef) {
+      const err = new Error("Session is missing zone_id");
+      err.code = "missing_zone_id";
+      throw err;
+    }
+
+    const zoneSnap = await tx.get(zoneRef);
+    const zoneData = zoneSnap.exists ? zoneSnap.data() || {} : {};
+    const existingActive = await findActiveSessionForUserZone(tx, {
+      targetSessionId: sessionSnap.id,
+      userValue: data.user_id,
+      zoneRef,
+    });
+
+    if (existingActive) {
+      console.warn("[PARKING] Duplicate active prevented", {
+        requestedSessionId: sessionSnap.id,
+        existingSessionId: existingActive.id,
+        source,
+      });
+
+      return {
+        sessionId: existingActive.id,
+        sessionData: existingActive.data() || {},
+        zoneData,
+        alreadyActive: true,
+        activated: false,
+        duplicateActivePrevented: true,
+      };
+    }
+
+    const now = admin.firestore.FieldValue.serverTimestamp();
+    const ratePerMinute =
+      typeof zoneData.rate_per_hour === "number"
+        ? Number((zoneData.rate_per_hour / 60).toFixed(6))
+        : 0;
+
+    tx.update(sessionSnap.ref, {
+      status: "ACTIVE",
+      started_at: now,
+      activated_at: now,
+      rate_per_minute: ratePerMinute,
+      regulation_type: zoneData.regulation_type ?? null,
+      sensor_id: data.sensor_id ?? data.zone_number ?? null,
+      payment_method: "MOBILE",
+      price_charged: 0,
+      total_minutes: 0,
+      endingSoonNotified: false,
+      last_updated: now,
+    });
+
+    tx.update(zoneRef, {
+      is_available: false,
+      last_updated: now,
+    });
+
+    console.log("[PARKING] Activation completed", {
+      sessionId: sessionSnap.id,
+      source,
+    });
+
+    return {
+      sessionId: sessionSnap.id,
+      sessionData: data,
+      zoneData,
+      alreadyActive: false,
+      activated: true,
+      duplicateActivePrevented: false,
+    };
+  });
+
+  return result;
+}
+
 setInterval(async () => {
   try {
     const now = admin.firestore.Timestamp.now();
@@ -332,10 +508,9 @@ setInterval(async () => {
         zoneData.is_available === false || zoneData.is_available === "false";
 
       if (occupied) {
-        await docSnap.ref.update({
-          status: "ACTIVE",
-          activated_at: admin.firestore.FieldValue.serverTimestamp(),
-          endingSoonNotified: false,
+        await activateParkingSession({
+          sessionRef: docSnap.ref,
+          source: "countdown_auto_confirm",
         });
       } else {
         // Do not hard-delete pending sessions here. Deletions cause confirm-session 404 races.
@@ -1119,11 +1294,10 @@ app.post("/api/parking/confirm-session", async (req, res) => {
         }
 
         const data = sessionSnap.data();
-        const sessionIdToUse = sessionSnap.id;
         const sessionRefToUse = sessionSnap.ref;
         const status = typeof data.status === "string" ? data.status.toUpperCase() : "";
         console.log("🔁 Confirming session with status:", status);
-        const isRecoverable = status === "PENDING" || status === "EXPIRED";
+        const isRecoverable = status === "PENDING" || status === "EXPIRED" || status === "ACTIVE";
 
         if (!isRecoverable) {
             return res.status(409).json({
@@ -1132,85 +1306,72 @@ app.post("/api/parking/confirm-session", async (req, res) => {
             });
         }
 
-        let zoneData = {};
-        if (data.zone_id) {
-            const zoneRef =
-                typeof data.zone_id === "string" ? db.doc(data.zone_id) : data.zone_id;
-            const zoneSnap = await zoneRef.get();
-            if (zoneSnap.exists) {
-                zoneData = zoneSnap.data() || {};
+        const activation = await activateParkingSession({
+            sessionRef: sessionRefToUse,
+            source: "manual_confirm",
+        });
+
+        console.log("✅ Session confirmed:", activation.sessionId);
+
+        // Send "parking started" email
+        if (activation.activated) {
+            try {
+                const userId = getUserIdValue(data.user_id);
+                const zoneId = getDocPath(data.zone_id);
+
+                await notifySessionStarted(
+                    userId,
+                    zoneId,
+                    activation.sessionId
+                );
+                console.log("Push: session_started", activation.sessionId);
+            } catch (e) {
+                console.error("Push failed (session_started):", e);
+            }
+
+            try {
+                const userRef = data.user_id; // users/<uid> doc ref
+                const userSnap = userRef ? await userRef.get() : null;
+                const user = userSnap?.exists ? userSnap.data() : {};
+                const toEmail = user?.email;
+
+                if (toEmail) {
+                    const email = buildParkingStartedEmail({
+                        firstName: resolveUserFirstName(user),
+                        supportEmail: "support@openspots.app",
+                        appUrl: process.env.BASE_URL || "https://openspots.app",
+                        zoneNumber: data.zone_number,
+                        startedAt: "Just now",
+                        ratePerHour: activation.zoneData?.rate_per_hour,
+                        socials: SOCIALS
+                    });
+
+                    await sendEmail({ to: toEmail, subject: email.subject, html: email.html, text: email.text });
+                    console.log("✅ Parking started email sent:", toEmail);
+                }
+            } catch (e) {
+                console.error("Parking started email failed:", e);
             }
         }
 
-        const ratePerMinute =
-            typeof zoneData.rate_per_hour === "number"
-                ? Number((zoneData.rate_per_hour / 60).toFixed(6))
-                : 0;
-
-        await sessionRefToUse.update({
-            status: "ACTIVE",
-            started_at: admin.firestore.FieldValue.serverTimestamp(),
-            activated_at: admin.firestore.FieldValue.serverTimestamp(),
-            rate_per_minute: ratePerMinute,
-            regulation_type: zoneData.regulation_type,
-            sensor_id: data.zone_number,
-            payment_method: "MOBILE",
-            price_charged: 0,
-            total_minutes: 0,
-            endingSoonNotified: false
+        return res.json({
+            success: true,
+            sessionId: activation.sessionId,
+            alreadyActive: activation.alreadyActive,
+            duplicateActivePrevented: activation.duplicateActivePrevented
         });
-
-        console.log("✅ Session confirmed:", sessionIdToUse);
-        try {
-            const userId = getUserIdValue(data.user_id);
-            const zoneId = getDocPath(data.zone_id);
-
-            await notifySessionStarted(
-                userId,
-                zoneId,
-                sessionIdToUse
-            );
-            console.log("Push: session_started", sessionIdToUse);
-        } catch (e) {
-            console.error("Push failed (session_started):", e);
-        }
-
-        if (data.zone_id) {
-            const zoneRef =
-                typeof data.zone_id === "string" ? db.doc(data.zone_id) : data.zone_id;
-            await zoneRef.update({
-                is_available: false,
-                last_updated: admin.firestore.FieldValue.serverTimestamp()
+    } catch (err) {
+        if (err?.code === "session_not_recoverable") {
+            return res.status(409).json({
+                error: "Session is not recoverable",
+                status: err.status
             });
         }
 
-        // Send "parking started" email
-        try {
-            const userRef = data.user_id; // users/<uid> doc ref
-            const userSnap = userRef ? await userRef.get() : null;
-            const user = userSnap?.exists ? userSnap.data() : {};
-            const toEmail = user?.email;
-
-            if (toEmail) {
-                const email = buildParkingStartedEmail({
-                    firstName: resolveUserFirstName(user),
-                    supportEmail: "support@openspots.app",
-                    appUrl: process.env.BASE_URL || "https://openspots.app",
-                    zoneNumber: data.zone_number,
-                    startedAt: "Just now",
-                    ratePerHour: zoneData?.rate_per_hour,
-                    socials: SOCIALS
-                });
-
-                await sendEmail({ to: toEmail, subject: email.subject, html: email.html, text: email.text });
-                console.log("✅ Parking started email sent:", toEmail);
-            }
-        } catch (e) {
-            console.error("Parking started email failed:", e);
+        if (err?.code === "session_not_found") {
+            return res.status(404).json({ error: "Session not found" });
         }
 
-        return res.json({ success: true, sessionId: sessionIdToUse });
-    } catch (err) {
         console.error("Failed to confirm parking session:", err);
         return res.status(500).json({ error: "Failed to confirm session" });
     }
