@@ -1,6 +1,10 @@
 import { normalizeSensorPayload } from "./validateSensor.js";
 import { getAdmin, getFirestore, processSensorOccupancy } from "./sessionEngine.js";
 
+const ACTIVE_PRESENCE_WINDOW_MS = 120 * 1000;
+const NEARBY_DISTANCE_FEET = 100;
+const FEET_PER_METER = 3.28084;
+
 export async function sensorProcessor(payload) {
   const provider = payload?.sensorProvider ?? payload?.sensor_provider;
   if (provider === "urbiotica") {
@@ -107,17 +111,30 @@ async function processUrbioticaSensorEvent(payload) {
 
     await doc.ref.update(updatePayload);
 
+    let pendingSessionResult = null;
+    if (payload.vehiclePresence === true) {
+      pendingSessionResult = await createPendingSessionForNearbyUser({
+        db,
+        admin,
+        spotDoc: doc,
+        spotData: existing,
+        payload,
+      });
+    }
+
     console.log("[AMQP] Updated Urbiotica vehicle spot", {
       docId: doc.id,
       oldAvailability: existing.is_available ?? null,
       newAvailability,
       sensorStatus: updatePayload.sensor_status,
+      pendingSessionDecision: pendingSessionResult?.decision ?? null,
     });
 
     return {
       decision: "urbiotica_vehicle_availability_updated",
       spotId: doc.id,
       isAvailable: newAvailability,
+      pendingSession: pendingSessionResult,
     };
   }
 
@@ -185,6 +202,346 @@ function queryValues(value) {
   }
 
   return values;
+}
+
+async function createPendingSessionForNearbyUser({ db, admin, spotDoc, spotData, payload }) {
+  const candidates = await findNearbyActivePresenceCandidates({ db, spotDoc, spotData, payload });
+
+  console.log("[AMQP] Nearby active FindSpot candidates found", {
+    spotId: spotDoc.id,
+    count: candidates.length,
+    candidates: candidates.map((candidate) => ({
+      uid: candidate.uid,
+      distanceFeet: Number(candidate.distanceFeet.toFixed(2)),
+    })),
+  });
+
+  if (candidates.length === 0) {
+    console.log("[AMQP] No nearby active FindSpot user for sensor vehicle event", {
+      spotId: spotDoc.id,
+    });
+    return { decision: "no_nearby_active_user" };
+  }
+
+  if (candidates.length > 1) {
+    console.warn("[AMQP] Ambiguous nearby active FindSpot users for sensor vehicle event", {
+      spotId: spotDoc.id,
+      candidates: candidates.map((candidate) => ({
+        uid: candidate.uid,
+        distanceFeet: Number(candidate.distanceFeet.toFixed(2)),
+      })),
+    });
+    return { decision: "ambiguous_nearby_active_users", candidateCount: candidates.length };
+  }
+
+  return createPendingSessionIfEligible({
+    db,
+    admin,
+    spotDoc,
+    spotData,
+    payload,
+    candidate: candidates[0],
+  });
+}
+
+async function findNearbyActivePresenceCandidates({ db, spotDoc, spotData, payload }) {
+  const spotLocation = extractLatLng(spotData) || extractLatLng(payload);
+  if (!spotLocation) {
+    console.warn("[AMQP] Cannot match nearby users because spot has no coordinates", {
+      spotId: spotDoc.id,
+    });
+    return [];
+  }
+
+  const cutoffMs = Date.now() - ACTIVE_PRESENCE_WINDOW_MS;
+  const presenceSnap = await db
+    .collectionGroup("presence")
+    .where("app_state", "==", "active")
+    .limit(250)
+    .get();
+  const candidates = [];
+
+  for (const presenceDoc of presenceSnap.docs) {
+    if (presenceDoc.id !== "current") continue;
+
+    const presence = presenceDoc.data() || {};
+    if (presence.foreground_screen !== "FindSpot") continue;
+
+    const seenAtMs = toMillis(presence.last_location_seen_at);
+    if (!seenAtMs || seenAtMs < cutoffMs) continue;
+
+    const userLocation = extractLatLng(presence.last_location);
+    if (!userLocation) continue;
+
+    const distanceFeet = distanceInFeet(spotLocation, userLocation);
+    const uid = presence.uid || presenceDoc.ref.parent.parent?.id || null;
+
+    console.log("[AMQP] Nearby user distance calculated", {
+      spotId: spotDoc.id,
+      uid,
+      distanceFeet: Number(distanceFeet.toFixed(2)),
+    });
+
+    if (uid && distanceFeet <= NEARBY_DISTANCE_FEET) {
+      candidates.push({
+        uid,
+        distanceFeet,
+        presence,
+        presenceRef: presenceDoc.ref,
+      });
+    }
+  }
+
+  return candidates;
+}
+
+async function createPendingSessionIfEligible({ db, admin, spotDoc, spotData, payload, candidate }) {
+  const userRef = db.collection("users").doc(candidate.uid);
+  const now = admin.firestore.FieldValue.serverTimestamp();
+
+  return db.runTransaction(async (tx) => {
+    const existingForUser = await getCurrentUserSessions(tx, db, {
+      userRef,
+      uid: candidate.uid,
+    });
+    const activeUserSession = existingForUser.find((session) => session.status === "ACTIVE");
+    const sameSpotPendingUserSession = existingForUser.find((session) =>
+      session.status === "PENDING" && sameSpot(session.data.zone_id, spotDoc.ref)
+    );
+    const pendingUserSession = existingForUser.find((session) => session.status === "PENDING");
+
+    if (activeUserSession) {
+      console.log("[AMQP] Active user session exists; skipping sensor pending creation", {
+        uid: candidate.uid,
+        sessionId: activeUserSession.doc.id,
+        spotId: spotDoc.id,
+      });
+      return { decision: "user_active_session_exists", sessionId: activeUserSession.doc.id };
+    }
+
+    if (sameSpotPendingUserSession) {
+      console.log("[AMQP] Existing pending session reused for sensor vehicle event", {
+        uid: candidate.uid,
+        sessionId: sameSpotPendingUserSession.doc.id,
+        spotId: spotDoc.id,
+      });
+      return { decision: "existing_pending_reused", sessionId: sameSpotPendingUserSession.doc.id };
+    }
+
+    if (pendingUserSession) {
+      console.log("[AMQP] User already has pending session for another spot; skipping", {
+        uid: candidate.uid,
+        sessionId: pendingUserSession.doc.id,
+        spotId: spotDoc.id,
+      });
+      return { decision: "user_pending_session_exists", sessionId: pendingUserSession.doc.id };
+    }
+
+    const existingForSpot = await getCurrentSpotSessions(tx, db, spotDoc.ref);
+    const activeSpotSession = existingForSpot.find((session) => session.status === "ACTIVE");
+    const pendingSpotSession = existingForSpot.find((session) => session.status === "PENDING");
+
+    if (activeSpotSession) {
+      console.log("[AMQP] Active spot session exists; skipping sensor pending creation", {
+        uid: candidate.uid,
+        sessionId: activeSpotSession.doc.id,
+        spotId: spotDoc.id,
+      });
+      return { decision: "spot_active_session_exists", sessionId: activeSpotSession.doc.id };
+    }
+
+    if (pendingSpotSession) {
+      console.log("[AMQP] Existing pending session for spot reused/skipped", {
+        uid: candidate.uid,
+        sessionId: pendingSpotSession.doc.id,
+        spotId: spotDoc.id,
+      });
+      return { decision: "spot_pending_session_exists", sessionId: pendingSpotSession.doc.id };
+    }
+
+    const sessionRef = db.collection("parking_sessions").doc();
+    const ratePerHour = numberOrNull(spotData.rate_per_hour);
+    const ratePerMinute = numberOrNull(spotData.rate_per_minute) ??
+      (ratePerHour !== null ? Number((ratePerHour / 60).toFixed(6)) : null);
+
+    tx.set(sessionRef, withoutUndefined({
+      status: "PENDING",
+      pending_source: "sensor_nearby_user",
+      pending_started_at: now,
+      created_at: now,
+      user_id: userRef,
+      user_uid: candidate.uid,
+      zone_id: spotDoc.ref,
+      zone_number: spotData.zone_number ?? payload.zoneId,
+      location_name: spotData.location_name ?? spotData.name ?? payload.description,
+      rate_per_hour: ratePerHour,
+      rate_per_minute: ratePerMinute,
+      sensor_provider: "urbiotica",
+      sensor_id: payload.elementId ?? spotData.urbiotica_element_id,
+      urbiotica_element_id: payload.elementId ?? spotData.urbiotica_element_id,
+      urbiotica_pom_id: payload.pomId ?? payload.measurementPointId ?? spotData.urbiotica_pom_id,
+      sensor_confirmed: true,
+      vehicle_detected_at: now,
+    }));
+
+    console.log("[AMQP] Pending parking session created from nearby sensor match", {
+      uid: candidate.uid,
+      sessionId: sessionRef.id,
+      spotId: spotDoc.id,
+      distanceFeet: Number(candidate.distanceFeet.toFixed(2)),
+    });
+
+    return { decision: "pending_session_created", sessionId: sessionRef.id };
+  });
+}
+
+async function getCurrentUserSessions(tx, db, { userRef, uid }) {
+  const docs = new Map();
+  const userRefSnap = await tx.get(
+    db
+      .collection("parking_sessions")
+      .where("user_id", "==", userRef)
+      .limit(30)
+  );
+  const userUidSnap = await tx.get(
+    db
+      .collection("parking_sessions")
+      .where("user_uid", "==", uid)
+      .limit(30)
+  );
+  const userIdStringSnap = await tx.get(
+    db
+      .collection("parking_sessions")
+      .where("user_id", "==", uid)
+      .limit(30)
+  );
+
+  for (const doc of [...userRefSnap.docs, ...userUidSnap.docs, ...userIdStringSnap.docs]) {
+    if (isPendingOrActive(doc.data()?.status)) {
+      docs.set(doc.id, doc);
+    }
+  }
+
+  return sortCurrentSessions(Array.from(docs.values()));
+}
+
+async function getCurrentSpotSessions(tx, db, spotRef) {
+  const docs = new Map();
+  const spotRefSnap = await tx.get(
+    db
+      .collection("parking_sessions")
+      .where("zone_id", "==", spotRef)
+      .limit(30)
+  );
+  const spotPathSnap = await tx.get(
+    db
+      .collection("parking_sessions")
+      .where("zone_id", "==", spotRef.path)
+      .limit(30)
+  );
+
+  for (const doc of [...spotRefSnap.docs, ...spotPathSnap.docs]) {
+    if (isPendingOrActive(doc.data()?.status)) {
+      docs.set(doc.id, doc);
+    }
+  }
+
+  return sortCurrentSessions(Array.from(docs.values()));
+}
+
+function sortCurrentSessions(docs) {
+  return docs
+    .map((doc) => ({ doc, data: doc.data() || {} }))
+    .sort((a, b) => {
+      if (a.data.status === "ACTIVE" && b.data.status !== "ACTIVE") return -1;
+      if (b.data.status === "ACTIVE" && a.data.status !== "ACTIVE") return 1;
+      return timestampMillis(b.data.created_at ?? b.data.pending_started_at) -
+        timestampMillis(a.data.created_at ?? a.data.pending_started_at);
+    })
+    .map((session) => ({
+      doc: session.doc,
+      data: session.data,
+      status: session.data.status,
+    }));
+}
+
+function sameSpot(zoneValue, spotRef) {
+  if (!zoneValue || !spotRef) return false;
+  if (typeof zoneValue === "string") return zoneValue === spotRef.path;
+  return zoneValue.path === spotRef.path;
+}
+
+function isPendingOrActive(status) {
+  return status === "PENDING" || status === "ACTIVE";
+}
+
+function extractLatLng(value) {
+  if (!value) return null;
+
+  if (typeof value.latitude === "number" && typeof value.longitude === "number") {
+    return { latitude: value.latitude, longitude: value.longitude };
+  }
+
+  if (typeof value.lat === "number" && typeof value.lng === "number") {
+    return { latitude: value.lat, longitude: value.lng };
+  }
+
+  if (typeof value.latitude === "string" && typeof value.longitude === "string") {
+    const latitude = Number(value.latitude);
+    const longitude = Number(value.longitude);
+    if (Number.isFinite(latitude) && Number.isFinite(longitude)) {
+      return { latitude, longitude };
+    }
+  }
+
+  if (typeof value.lat === "string" && typeof value.lng === "string") {
+    const latitude = Number(value.lat);
+    const longitude = Number(value.lng);
+    if (Number.isFinite(latitude) && Number.isFinite(longitude)) {
+      return { latitude, longitude };
+    }
+  }
+
+  return extractLatLng(value.location) ||
+    extractLatLng(value.geo) ||
+    extractLatLng(value.geopoint) ||
+    extractLatLng(value.coordinates) ||
+    null;
+}
+
+function distanceInFeet(a, b) {
+  const toRadians = (degrees) => degrees * Math.PI / 180;
+  const earthRadiusMeters = 6371000;
+  const dLat = toRadians(b.latitude - a.latitude);
+  const dLon = toRadians(b.longitude - a.longitude);
+  const lat1 = toRadians(a.latitude);
+  const lat2 = toRadians(b.latitude);
+  const haversine = Math.sin(dLat / 2) ** 2 +
+    Math.cos(lat1) * Math.cos(lat2) * Math.sin(dLon / 2) ** 2;
+  const meters = 2 * earthRadiusMeters * Math.atan2(Math.sqrt(haversine), Math.sqrt(1 - haversine));
+  return meters * FEET_PER_METER;
+}
+
+function toMillis(value) {
+  if (!value) return null;
+  if (typeof value.toMillis === "function") return value.toMillis();
+  if (typeof value.toDate === "function") return value.toDate().getTime();
+  if (value instanceof Date) return value.getTime();
+  if (typeof value === "number") return value;
+  if (typeof value === "string") {
+    const parsed = Date.parse(value);
+    return Number.isNaN(parsed) ? null : parsed;
+  }
+  return null;
+}
+
+function timestampMillis(value) {
+  return toMillis(value) ?? 0;
+}
+
+function numberOrNull(value) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
 }
 
 function summarizeUrbioticaPayload(payload) {
