@@ -326,6 +326,45 @@ async function activateParkingSession({ sessionRef, source }) {
 
     const zoneSnap = await tx.get(zoneRef);
     const zoneData = zoneSnap.exists ? zoneSnap.data() || {} : {};
+    const spotOccupied = zoneData.sensor_status === "occupied" || zoneData.is_available === false;
+
+    if (!spotOccupied) {
+      console.warn("[PARKING] Activation blocked because spot is available", {
+        sessionId: sessionSnap.id,
+        source,
+        sensorStatus: zoneData.sensor_status ?? null,
+        isAvailable: zoneData.is_available ?? null,
+      });
+
+      const now = admin.firestore.FieldValue.serverTimestamp();
+      if (status === "PENDING") {
+        tx.update(sessionSnap.ref, {
+          status: "CANCELLED",
+          cancellation_reason: "spot_available_before_activation",
+          cancelled_at: now,
+          last_updated: now,
+        });
+      }
+
+      return {
+        sessionId: sessionSnap.id,
+        sessionData: data,
+        zoneData,
+        alreadyActive: false,
+        activated: false,
+        duplicateActivePrevented: false,
+        activationBlocked: true,
+        reason: "spot_available_before_activation",
+      };
+    }
+
+    console.log("[PARKING] Activation allowed because spot remains occupied", {
+      sessionId: sessionSnap.id,
+      source,
+      sensorStatus: zoneData.sensor_status ?? null,
+      isAvailable: zoneData.is_available ?? null,
+    });
+
     const existingActive = await findActiveSessionForUserZone(tx, {
       targetSessionId: sessionSnap.id,
       userValue: data.user_id,
@@ -515,9 +554,17 @@ setInterval(async () => {
       } else {
         // Do not hard-delete pending sessions here. Deletions cause confirm-session 404 races.
         // Keep the document and mark it as expired so clients/backend can still reason about it.
+        console.warn("[PARKING] Activation blocked because spot is available", {
+          sessionId: docSnap.id,
+          source: "countdown_auto_confirm",
+          sensorStatus: zoneData.sensor_status ?? null,
+          isAvailable: zoneData.is_available ?? null,
+        });
         await docSnap.ref.update({
           status: "EXPIRED",
-          expired_at: admin.firestore.FieldValue.serverTimestamp()
+          cancellation_reason: "spot_available_before_activation",
+          expired_at: admin.firestore.FieldValue.serverTimestamp(),
+          last_updated: admin.firestore.FieldValue.serverTimestamp()
         });
         console.warn("⌛ Marked pending session as EXPIRED:", docSnap.id);
       }

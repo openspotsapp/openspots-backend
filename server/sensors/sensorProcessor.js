@@ -120,6 +120,12 @@ async function processUrbioticaSensorEvent(payload) {
         spotData: existing,
         payload,
       });
+    } else {
+      pendingSessionResult = await cancelSensorPendingSessionsForClearedSpot({
+        db,
+        admin,
+        spotDoc: doc,
+      });
     }
 
     console.log("[AMQP] Updated Urbiotica vehicle spot", {
@@ -242,6 +248,46 @@ async function createPendingSessionForNearbyUser({ db, admin, spotDoc, spotData,
     payload,
     candidate: candidates[0],
   });
+}
+
+async function cancelSensorPendingSessionsForClearedSpot({ db, admin, spotDoc }) {
+  const pendingSessions = await getPendingSessionsForSpot(db, spotDoc.ref);
+  const sensorPendingSessions = pendingSessions.filter((session) =>
+    session.data.pending_source === "sensor_nearby_user"
+  );
+
+  if (sensorPendingSessions.length === 0) {
+    console.log("[AMQP] No sensor-created pending sessions to cancel after sensor cleared", {
+      spotId: spotDoc.id,
+    });
+    return { decision: "no_sensor_pending_sessions_to_cancel", cancelledCount: 0 };
+  }
+
+  const batch = db.batch();
+  const now = admin.firestore.FieldValue.serverTimestamp();
+
+  for (const session of sensorPendingSessions) {
+    batch.update(session.doc.ref, {
+      status: "CANCELLED",
+      cancellation_reason: "sensor_cleared_before_confirmation",
+      cancelled_at: now,
+      last_updated: now,
+    });
+  }
+
+  await batch.commit();
+
+  console.log("[AMQP] Pending sessions cancelled because sensor cleared before confirmation", {
+    spotId: spotDoc.id,
+    sessionIds: sensorPendingSessions.map((session) => session.doc.id),
+    reason: "sensor_cleared_before_confirmation",
+  });
+
+  return {
+    decision: "sensor_pending_sessions_cancelled",
+    cancelledCount: sensorPendingSessions.length,
+    sessionIds: sensorPendingSessions.map((session) => session.doc.id),
+  };
 }
 
 async function findNearbyActivePresenceCandidates({ db, spotDoc, spotData, payload }) {
@@ -447,6 +493,28 @@ async function getCurrentSpotSessions(tx, db, spotRef) {
   }
 
   return sortCurrentSessions(Array.from(docs.values()));
+}
+
+async function getPendingSessionsForSpot(db, spotRef) {
+  const docs = new Map();
+  const spotRefSnap = await db
+    .collection("parking_sessions")
+    .where("zone_id", "==", spotRef)
+    .limit(30)
+    .get();
+  const spotPathSnap = await db
+    .collection("parking_sessions")
+    .where("zone_id", "==", spotRef.path)
+    .limit(30)
+    .get();
+
+  for (const doc of [...spotRefSnap.docs, ...spotPathSnap.docs]) {
+    if (doc.data()?.status === "PENDING") {
+      docs.set(doc.id, { doc, data: doc.data() || {} });
+    }
+  }
+
+  return Array.from(docs.values());
 }
 
 function sortCurrentSessions(docs) {
