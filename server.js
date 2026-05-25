@@ -432,40 +432,81 @@ async function activateParkingSession({ sessionRef, source }) {
 }
 
 async function sendParkingStartedSideEffects({ activation, fallbackSessionData }) {
+  console.log("[PARKING][DEBUG] parking-started side effects entered", {
+    sessionId: activation?.sessionId ?? null,
+    activated: activation?.activated ?? null,
+    source: activation?.source ?? null,
+    hasFallbackSessionData: Boolean(fallbackSessionData),
+  });
+
   if (!activation?.activated) {
     console.log("[PARKING] Skipping parking-started side effects: activation not activated", {
       sessionId: activation?.sessionId ?? null,
+      activated: activation?.activated ?? null,
+      source: activation?.source ?? null,
     });
     return;
   }
 
   const sessionData = activation.sessionData || fallbackSessionData || {};
+  const usedFallbackSessionData = !activation.sessionData && Boolean(fallbackSessionData);
   const userId = getUserIdValue(sessionData.user_id);
   const zoneId = getDocPath(sessionData.zone_id);
+  console.log("[PARKING][DEBUG] parking-started side effects resolved context", {
+    sessionId: activation.sessionId,
+    source: activation.source ?? null,
+    userId,
+    zoneId,
+    usedFallbackSessionData,
+  });
 
   if (!userId) {
     console.warn("[PARKING] Skipping parking-started side effects: no user id", {
       sessionId: activation.sessionId,
+      source: activation.source ?? null,
     });
     return;
   }
 
   try {
-    await notifySessionStarted(
+    console.log("[PARKING][DEBUG] Calling notifySessionStarted", {
+      sessionId: activation.sessionId,
+      userId,
+      zoneId,
+    });
+    const pushResult = await notifySessionStarted(
       userId,
       zoneId,
       activation.sessionId
     );
+    console.log("[PARKING][DEBUG] notifySessionStarted result", {
+      sessionId: activation.sessionId,
+      result: pushResult ?? null,
+    });
     console.log("Push: session_started", activation.sessionId);
   } catch (e) {
     console.error("Push failed (session_started):", e);
   }
 
   try {
+    console.log("[PARKING][DEBUG] Entering parking-started email branch", {
+      sessionId: activation.sessionId,
+      userId,
+    });
     const userRef = db.collection("users").doc(userId);
     const userSnap = await userRef.get();
+    console.log("[PARKING][DEBUG] Parking-started email user lookup", {
+      sessionId: activation.sessionId,
+      userId,
+      userDocExists: userSnap.exists,
+    });
     const user = userSnap?.exists ? userSnap.data() : {};
     const toEmail = user?.email;
+    console.log("[PARKING][DEBUG] Parking-started email recipient check", {
+      sessionId: activation.sessionId,
+      userId,
+      hasEmail: Boolean(toEmail),
+    });
 
     if (!toEmail) {
       console.warn("[PARKING] Skipping parking-started email: no email", {
@@ -485,6 +526,11 @@ async function sendParkingStartedSideEffects({ activation, fallbackSessionData }
       socials: SOCIALS
     });
 
+    console.log("[PARKING][DEBUG] Calling sendEmail for parking-started email", {
+      sessionId: activation.sessionId,
+      userId,
+      toEmail,
+    });
     await sendEmail({ to: toEmail, subject: email.subject, html: email.html, text: email.text });
     console.log("✅ Parking started email sent:", toEmail);
   } catch (e) {

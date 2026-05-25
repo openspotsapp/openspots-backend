@@ -46,10 +46,26 @@ async function removeInvalidTokens(tokens) {
   }
 }
 
+function getTokenType(token) {
+  if (token.startsWith("ExponentPushToken")) return "ExponentPushToken";
+  if (token.startsWith("ExpoPushToken")) return "ExpoPushToken";
+  return "fcm_like";
+}
+
 export async function sendPushToTokens(tokens, payload) {
   const uniqueTokens = Array.isArray(tokens)
     ? [...new Set(tokens.filter((t) => typeof t === "string" && t.trim().length > 0))]
     : [];
+  const tokenTypeSummary = uniqueTokens.reduce((summary, token) => {
+    const tokenType = getTokenType(token);
+    summary[tokenType] = (summary[tokenType] || 0) + 1;
+    return summary;
+  }, {});
+
+  console.log("[FCM][DEBUG] Preparing multicast push", {
+    tokenCount: uniqueTokens.length,
+    tokenTypeSummary,
+  });
 
   if (uniqueTokens.length === 0) {
     return { successCount: 0, failureCount: 0, responses: [] };
@@ -73,6 +89,17 @@ export async function sendPushToTokens(tokens, payload) {
   console.log("[FCM] sendEachForMulticast result", {
     successCount: response.successCount,
     failureCount: response.failureCount,
+  });
+  console.log("[FCM][DEBUG] sendEachForMulticast response summary", {
+    successCount: response.successCount,
+    failureCount: response.failureCount,
+    responses: response.responses.map((entry, idx) => ({
+      index: idx,
+      tokenType: getTokenType(uniqueTokens[idx]),
+      success: entry.success,
+      errorCode: entry.error?.code ?? null,
+      errorMessage: entry.error?.message ?? null,
+    })),
   });
 
   const invalidTokens = [];

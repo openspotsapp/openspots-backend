@@ -21,6 +21,9 @@ function getDb() {
 
 async function getUserNotificationContext(userId) {
   if (!userId || typeof userId !== "string") {
+    console.warn("[NOTIFICATIONS][DEBUG] Skipping notification lookup: invalid userId", {
+      userId: userId ?? null,
+    });
     return { canNotify: false, tokens: [] };
   }
 
@@ -28,12 +31,36 @@ async function getUserNotificationContext(userId) {
   const userSnap = await db.collection("users").doc(userId).get();
 
   if (!userSnap.exists) {
+    console.warn("[NOTIFICATIONS][DEBUG] Skipping notifications: user doc missing", {
+      userId,
+      userDocExists: false,
+    });
     return { canNotify: false, tokens: [] };
   }
 
   const user = userSnap.data() || {};
   const tokens = Array.isArray(user.fcm_tokens) ? user.fcm_tokens : [];
   const canNotify = user.notifications_enabled !== false;
+  console.log("[NOTIFICATIONS][DEBUG] User notification context", {
+    userId,
+    userDocExists: true,
+    fcmTokenCount: tokens.length,
+    notificationsEnabled: user.notifications_enabled ?? null,
+    canNotify,
+  });
+
+  if (!canNotify) {
+    console.warn("[NOTIFICATIONS][DEBUG] Skipping notifications: notifications disabled", {
+      userId,
+      notificationsEnabled: user.notifications_enabled,
+    });
+  }
+
+  if (tokens.length === 0) {
+    console.warn("[NOTIFICATIONS][DEBUG] Skipping notifications: no fcm_tokens", {
+      userId,
+    });
+  }
 
   return { canNotify, tokens };
 }

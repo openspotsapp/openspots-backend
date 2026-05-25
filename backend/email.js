@@ -17,6 +17,12 @@ export async function sendEmail({ to, subject, html, text }) {
       throw error;
     }
 
+    console.log("[EMAIL][DEBUG] Resend email sent", {
+      id: data?.id ?? null,
+      to,
+      subject,
+    });
+
     return data;
   } catch (err) {
     console.error("Email send failed:", err);
