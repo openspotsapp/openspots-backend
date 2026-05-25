@@ -432,6 +432,11 @@ async function activateParkingSession({ sessionRef, source }) {
 }
 
 async function sendParkingStartedSideEffects({ activation, fallbackSessionData }) {
+  console.log("[PARKING_START_SIDE_EFFECTS_ENTERED]", {
+    sessionId: activation?.sessionId,
+    activated: activation?.activated,
+  });
+
   console.log("[PARKING][DEBUG] parking-started side effects entered", {
     sessionId: activation?.sessionId ?? null,
     activated: activation?.activated ?? null,
