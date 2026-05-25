@@ -112,6 +112,7 @@ async function processUrbioticaSensorEvent(payload) {
     await doc.ref.update(updatePayload);
 
     let pendingSessionResult = null;
+    let activeSessionCompletionResult = null;
     if (payload.vehiclePresence === true) {
       pendingSessionResult = await createPendingSessionForNearbyUser({
         db,
@@ -126,6 +127,12 @@ async function processUrbioticaSensorEvent(payload) {
         admin,
         spotDoc: doc,
       });
+      activeSessionCompletionResult = await completeActiveSessionForClearedSpot({
+        db,
+        admin,
+        spotDoc: doc,
+        spotData: existing,
+      });
     }
 
     console.log("[AMQP] Updated Urbiotica vehicle spot", {
@@ -134,6 +141,7 @@ async function processUrbioticaSensorEvent(payload) {
       newAvailability,
       sensorStatus: updatePayload.sensor_status,
       pendingSessionDecision: pendingSessionResult?.decision ?? null,
+      activeSessionCompletionDecision: activeSessionCompletionResult?.decision ?? null,
     });
 
     return {
@@ -141,6 +149,7 @@ async function processUrbioticaSensorEvent(payload) {
       spotId: doc.id,
       isAvailable: newAvailability,
       pendingSession: pendingSessionResult,
+      activeSessionCompletion: activeSessionCompletionResult,
     };
   }
 
@@ -288,6 +297,83 @@ async function cancelSensorPendingSessionsForClearedSpot({ db, admin, spotDoc })
     cancelledCount: sensorPendingSessions.length,
     sessionIds: sensorPendingSessions.map((session) => session.doc.id),
   };
+}
+
+async function completeActiveSessionForClearedSpot({ db, admin, spotDoc, spotData }) {
+  const activeSessions = await getActiveSessionsForSpot(db, spotDoc.ref);
+
+  if (activeSessions.length === 0) {
+    console.log("[AMQP] No ACTIVE parking session to complete after sensor cleared", {
+      spotId: spotDoc.id,
+    });
+    return { decision: "no_active_session_for_sensor_leave" };
+  }
+
+  if (activeSessions.length > 1) {
+    console.warn("[AMQP] Multiple ACTIVE sessions found for sensor-cleared spot; completing most recent only", {
+      spotId: spotDoc.id,
+      sessionIds: activeSessions.map((session) => session.doc.id),
+    });
+  }
+
+  const targetSession = activeSessions[0];
+
+  return db.runTransaction(async (tx) => {
+    const sessionSnap = await tx.get(targetSession.doc.ref);
+    if (!sessionSnap.exists) {
+      console.warn("[AMQP] ACTIVE session disappeared before sensor completion", {
+        spotId: spotDoc.id,
+        sessionId: targetSession.doc.id,
+      });
+      return { decision: "active_session_missing_before_completion" };
+    }
+
+    const sessionData = sessionSnap.data() || {};
+    if (sessionData.status !== "ACTIVE") {
+      console.log("[AMQP] Session no longer ACTIVE before sensor completion", {
+        spotId: spotDoc.id,
+        sessionId: sessionSnap.id,
+        status: sessionData.status ?? null,
+      });
+      return { decision: "session_not_active_before_completion", sessionId: sessionSnap.id };
+    }
+
+    const nowDate = new Date();
+    const startMs = timestampMillis(sessionData.started_at ?? sessionData.activated_at);
+    const totalMinutes = startMs
+      ? Math.max(0, Math.floor((nowDate.getTime() - startMs) / 60000))
+      : 0;
+    const ratePerMinute = resolveRatePerMinute(sessionData, spotData);
+    const priceCharged = Number((totalMinutes * ratePerMinute).toFixed(2));
+    const now = admin.firestore.FieldValue.serverTimestamp();
+
+    tx.update(sessionSnap.ref, {
+      status: "COMPLETED",
+      completed_at: now,
+      ended_at: now,
+      departure_time: now,
+      total_minutes: totalMinutes,
+      price_charged: priceCharged,
+      completion_source: "sensor_vehicle_left",
+      payment_status: "pending",
+      last_updated: now,
+    });
+
+    console.log("[AMQP] ACTIVE parking session completed from sensor vehicle leave", {
+      spotId: spotDoc.id,
+      sessionId: sessionSnap.id,
+      totalMinutes,
+      priceCharged,
+      paymentStatus: "pending",
+    });
+
+    return {
+      decision: "active_session_completed_from_sensor_leave",
+      sessionId: sessionSnap.id,
+      totalMinutes,
+      priceCharged,
+    };
+  });
 }
 
 async function findNearbyActivePresenceCandidates({ db, spotDoc, spotData, payload }) {
@@ -517,6 +603,28 @@ async function getPendingSessionsForSpot(db, spotRef) {
   return Array.from(docs.values());
 }
 
+async function getActiveSessionsForSpot(db, spotRef) {
+  const docs = new Map();
+  const spotRefSnap = await db
+    .collection("parking_sessions")
+    .where("zone_id", "==", spotRef)
+    .limit(30)
+    .get();
+  const spotPathSnap = await db
+    .collection("parking_sessions")
+    .where("zone_id", "==", spotRef.path)
+    .limit(30)
+    .get();
+
+  for (const doc of [...spotRefSnap.docs, ...spotPathSnap.docs]) {
+    if (doc.data()?.status === "ACTIVE") {
+      docs.set(doc.id, { doc, data: doc.data() || {} });
+    }
+  }
+
+  return sortCurrentSessions(Array.from(docs.values()).map((session) => session.doc));
+}
+
 function sortCurrentSessions(docs) {
   return docs
     .map((doc) => ({ doc, data: doc.data() || {} }))
@@ -610,6 +718,16 @@ function timestampMillis(value) {
 function numberOrNull(value) {
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : null;
+}
+
+function resolveRatePerMinute(sessionData, spotData) {
+  const directRate = numberOrNull(sessionData.rate_per_minute ?? spotData.rate_per_minute);
+  if (directRate !== null) return directRate;
+
+  const hourlyRate = numberOrNull(sessionData.rate_per_hour ?? spotData.rate_per_hour);
+  if (hourlyRate !== null) return Number((hourlyRate / 60).toFixed(6));
+
+  return 0;
 }
 
 function summarizeUrbioticaPayload(payload) {
