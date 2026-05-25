@@ -431,6 +431,67 @@ async function activateParkingSession({ sessionRef, source }) {
   return result;
 }
 
+async function sendParkingStartedSideEffects({ activation, fallbackSessionData }) {
+  if (!activation?.activated) {
+    console.log("[PARKING] Skipping parking-started side effects: activation not activated", {
+      sessionId: activation?.sessionId ?? null,
+    });
+    return;
+  }
+
+  const sessionData = activation.sessionData || fallbackSessionData || {};
+  const userId = getUserIdValue(sessionData.user_id);
+  const zoneId = getDocPath(sessionData.zone_id);
+
+  if (!userId) {
+    console.warn("[PARKING] Skipping parking-started side effects: no user id", {
+      sessionId: activation.sessionId,
+    });
+    return;
+  }
+
+  try {
+    await notifySessionStarted(
+      userId,
+      zoneId,
+      activation.sessionId
+    );
+    console.log("Push: session_started", activation.sessionId);
+  } catch (e) {
+    console.error("Push failed (session_started):", e);
+  }
+
+  try {
+    const userRef = db.collection("users").doc(userId);
+    const userSnap = await userRef.get();
+    const user = userSnap?.exists ? userSnap.data() : {};
+    const toEmail = user?.email;
+
+    if (!toEmail) {
+      console.warn("[PARKING] Skipping parking-started email: no email", {
+        sessionId: activation.sessionId,
+        userId,
+      });
+      return;
+    }
+
+    const email = buildParkingStartedEmail({
+      firstName: resolveUserFirstName(user),
+      supportEmail: "support@openspots.app",
+      appUrl: process.env.BASE_URL || "https://openspots.app",
+      zoneNumber: sessionData.zone_number,
+      startedAt: "Just now",
+      ratePerHour: activation.zoneData?.rate_per_hour,
+      socials: SOCIALS
+    });
+
+    await sendEmail({ to: toEmail, subject: email.subject, html: email.html, text: email.text });
+    console.log("✅ Parking started email sent:", toEmail);
+  } catch (e) {
+    console.error("Parking started email failed:", e);
+  }
+}
+
 setInterval(async () => {
   try {
     const now = admin.firestore.Timestamp.now();
@@ -547,9 +608,13 @@ setInterval(async () => {
         zoneData.is_available === false || zoneData.is_available === "false";
 
       if (occupied) {
-        await activateParkingSession({
+        const activation = await activateParkingSession({
           sessionRef: docSnap.ref,
           source: "countdown_auto_confirm",
+        });
+        await sendParkingStartedSideEffects({
+          activation,
+          fallbackSessionData: data,
         });
       } else {
         // Do not hard-delete pending sessions here. Deletions cause confirm-session 404 races.
@@ -1360,46 +1425,10 @@ app.post("/api/parking/confirm-session", async (req, res) => {
 
         console.log("✅ Session confirmed:", activation.sessionId);
 
-        // Send "parking started" email
-        if (activation.activated) {
-            try {
-                const userId = getUserIdValue(data.user_id);
-                const zoneId = getDocPath(data.zone_id);
-
-                await notifySessionStarted(
-                    userId,
-                    zoneId,
-                    activation.sessionId
-                );
-                console.log("Push: session_started", activation.sessionId);
-            } catch (e) {
-                console.error("Push failed (session_started):", e);
-            }
-
-            try {
-                const userRef = data.user_id; // users/<uid> doc ref
-                const userSnap = userRef ? await userRef.get() : null;
-                const user = userSnap?.exists ? userSnap.data() : {};
-                const toEmail = user?.email;
-
-                if (toEmail) {
-                    const email = buildParkingStartedEmail({
-                        firstName: resolveUserFirstName(user),
-                        supportEmail: "support@openspots.app",
-                        appUrl: process.env.BASE_URL || "https://openspots.app",
-                        zoneNumber: data.zone_number,
-                        startedAt: "Just now",
-                        ratePerHour: activation.zoneData?.rate_per_hour,
-                        socials: SOCIALS
-                    });
-
-                    await sendEmail({ to: toEmail, subject: email.subject, html: email.html, text: email.text });
-                    console.log("✅ Parking started email sent:", toEmail);
-                }
-            } catch (e) {
-                console.error("Parking started email failed:", e);
-            }
-        }
+        await sendParkingStartedSideEffects({
+            activation,
+            fallbackSessionData: data,
+        });
 
         return res.json({
             success: true,
