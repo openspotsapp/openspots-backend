@@ -344,16 +344,24 @@ async function completeActiveSessionForClearedSpot({ db, admin, spotDoc, spotDat
       ? Math.max(0, Math.floor((nowDate.getTime() - startMs) / 60000))
       : 0;
     const ratePerMinute = resolveRatePerMinute(sessionData, spotData);
+    const ratePerHour = numberOrNull(sessionData.rate_per_hour ?? spotData.rate_per_hour);
     const priceCharged = Number((totalMinutes * ratePerMinute).toFixed(2));
     const now = admin.firestore.FieldValue.serverTimestamp();
 
     tx.update(sessionSnap.ref, {
       status: "COMPLETED",
+      started_at: sessionData.started_at ?? now,
+      activated_at: sessionData.activated_at ?? sessionData.started_at ?? now,
       completed_at: now,
       ended_at: now,
       departure_time: now,
       total_minutes: totalMinutes,
       price_charged: priceCharged,
+      total_amount: priceCharged,
+      rate_per_minute: ratePerMinute,
+      rate_per_hour: ratePerHour,
+      zone_number: sessionData.zone_number ?? spotData.zone_number,
+      location_name: sessionData.location_name ?? spotData.location_name ?? spotData.name,
       completion_source: "sensor_vehicle_left",
       payment_status: "pending",
       last_updated: now,

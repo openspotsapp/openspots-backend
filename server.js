@@ -390,15 +390,23 @@ async function activateParkingSession({ sessionRef, source }) {
 
     const now = admin.firestore.FieldValue.serverTimestamp();
     const ratePerMinute =
-      typeof zoneData.rate_per_hour === "number"
-        ? Number((zoneData.rate_per_hour / 60).toFixed(6))
-        : 0;
+      typeof data.rate_per_minute === "number"
+        ? data.rate_per_minute
+        : typeof zoneData.rate_per_minute === "number"
+          ? zoneData.rate_per_minute
+          : typeof zoneData.rate_per_hour === "number"
+            ? Number((zoneData.rate_per_hour / 60).toFixed(6))
+            : 0;
 
     tx.update(sessionSnap.ref, {
       status: "ACTIVE",
       started_at: now,
       activated_at: now,
       rate_per_minute: ratePerMinute,
+      rate_per_hour: data.rate_per_hour ?? zoneData.rate_per_hour,
+      zone_number: data.zone_number ?? zoneData.zone_number,
+      location_name: data.location_name ?? zoneData.location_name ?? zoneData.name,
+      arrival_time: data.arrival_time ?? now,
       regulation_type: zoneData.regulation_type ?? null,
       sensor_id: data.sensor_id ?? data.zone_number ?? null,
       payment_method: "MOBILE",
