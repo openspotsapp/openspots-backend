@@ -302,6 +302,7 @@ async function activateParkingSession({ sessionRef, source }) {
         source,
       });
       return {
+        source,
         sessionId: sessionSnap.id,
         sessionData: data,
         zoneData: {},
@@ -347,6 +348,7 @@ async function activateParkingSession({ sessionRef, source }) {
       }
 
       return {
+        source,
         sessionId: sessionSnap.id,
         sessionData: data,
         zoneData,
@@ -379,6 +381,7 @@ async function activateParkingSession({ sessionRef, source }) {
       });
 
       return {
+        source,
         sessionId: existingActive.id,
         sessionData: existingActive.data() || {},
         zoneData,
@@ -427,6 +430,7 @@ async function activateParkingSession({ sessionRef, source }) {
     });
 
     return {
+      source,
       sessionId: sessionSnap.id,
       sessionData: data,
       zoneData,
@@ -671,6 +675,16 @@ setInterval(async () => {
           sessionRef: docSnap.ref,
           source: "countdown_auto_confirm",
         });
+        console.log("[PARKING][COUNTDOWN] activation result", {
+          sessionId: activation.sessionId,
+          source: activation.source,
+          activated: activation.activated,
+          alreadyActive: activation.alreadyActive,
+          duplicateActivePrevented: activation.duplicateActivePrevented,
+          activationBlocked: activation.activationBlocked ?? false,
+          status: activation.sessionData?.status ?? null,
+        });
+        console.log("[PARKING][COUNTDOWN] calling parking-started side effects");
         await sendParkingStartedSideEffects({
           activation,
           fallbackSessionData: data,
